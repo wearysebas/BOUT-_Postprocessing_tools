@@ -43,6 +43,46 @@ import xbout
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.collections import PatchCollection
+from matplotlib.colors import LogNorm, Normalize
+
+
+def _make_norm(values, log, vmin=None, vmax=None):
+    """
+    Build a colour normalization (linear or logarithmic) from an array of
+    values.
+
+    For log scaling, non-positive entries are ignored when picking the limits
+    (``LogNorm`` cannot represent <= 0); if nothing positive is present we warn
+    and fall back to a linear scale so the script never crashes on, e.g., a
+    velocity field that straddles zero.
+
+    Parameters
+    ----------
+    values : array-like
+        The data that will be colour-mapped (used to auto-pick vmin/vmax).
+    log : bool
+        Request a :class:`~matplotlib.colors.LogNorm`.
+    vmin, vmax : float or None
+        Explicit limits; any left as ``None`` are taken from ``values``.
+
+    Returns
+    -------
+    matplotlib.colors.Normalize
+    """
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if log:
+        positive = finite[finite > 0]
+        if positive.size == 0:
+            print("[Hermes-3_postprocessing] --log requested but the data has "
+                  "no positive values; falling back to a linear colour scale.")
+        else:
+            lo = positive.min() if vmin is None else vmin
+            hi = positive.max() if vmax is None else vmax
+            return LogNorm(vmin=lo, vmax=hi)
+    lo = (finite.min() if finite.size else None) if vmin is None else vmin
+    hi = (finite.max() if finite.size else None) if vmax is None else vmax
+    return Normalize(vmin=lo, vmax=hi)
 
 
 def _proc_index(path):
@@ -405,27 +445,27 @@ def _decorate_axes(ax, rm, zm):
 
 
 def polygon_plot(ax, rm, zm, data, ny_inner, cmap="viridis",
-                 vmin=None, vmax=None, colorbar_label=None):
+                 vmin=None, vmax=None, colorbar_label=None, log=False):
     """
     Create a 2D polygon plot by iterating over raw gridue cells.
 
     data has shape (bout_nx, bout_ny) = (nx, ny) after stripping MXG guard cells.
+
+    ``log=True`` colours the cells on a logarithmic scale (LogNorm), which makes
+    changes spanning several orders of magnitude easier to read.
     """
     bout_nx, bout_ny = data.shape
     patches, ii, jj = _build_patches(rm, zm, ny_inner, bout_nx, bout_ny)
 
     colors = data[ii, jj]
-    if vmin is None:
-        vmin = np.nanmin(colors)
-    if vmax is None:
-        vmax = np.nanmax(colors)
+    norm = _make_norm(colors, log, vmin, vmax)
 
     collection = PatchCollection(
         patches, cmap=cmap, edgecolors="face",
         linewidths=0.1, joinstyle="bevel",
     )
     collection.set_array(colors)
-    collection.set_clim(vmin=vmin, vmax=vmax)
+    collection.set_norm(norm)
     ax.add_collection(collection)
 
     plt.colorbar(collection, ax=ax, label=colorbar_label, shrink=0.8)
@@ -436,7 +476,7 @@ def polygon_plot(ax, rm, zm, data, ny_inner, cmap="viridis",
 
 
 def animate_plot(fig, ax, rm, zm, data_t, ny_inner, times=None,
-                 cmap="viridis", colorbar_label=None, interval=200):
+                 cmap="viridis", colorbar_label=None, interval=200, log=False):
     """
     Animate the polygon plot over every available timestep.
 
@@ -462,16 +502,17 @@ def animate_plot(fig, ax, rm, zm, data_t, ny_inner, times=None,
     nt, bout_nx, bout_ny = data_t.shape
     patches, ii, jj = _build_patches(rm, zm, ny_inner, bout_nx, bout_ny)
 
-    # Fixed colour limits across the whole time series.
-    vmin = np.nanmin(data_t)
-    vmax = np.nanmax(data_t)
+    # Fixed colour normalization across the whole time series (built from the
+    # only cells that are actually drawn, so the log floor isn't dragged down by
+    # masked / off-grid entries).
+    norm = _make_norm(data_t[:, ii, jj], log)
 
     collection = PatchCollection(
         patches, cmap=cmap, edgecolors="face",
         linewidths=0.1, joinstyle="bevel",
     )
     collection.set_array(data_t[0][ii, jj])
-    collection.set_clim(vmin=vmin, vmax=vmax)
+    collection.set_norm(norm)
     ax.add_collection(collection)
 
     plt.colorbar(collection, ax=ax, label=colorbar_label, shrink=0.8)
@@ -525,6 +566,11 @@ if __name__ == "__main__":
                         help="Toroidal index (default: 0)")
     parser.add_argument("--cmap", type=str, default="viridis",
                         help="Colormap (default: viridis)")
+    parser.add_argument("--log", action="store_true", default=False,
+                        help="Use a logarithmic colour scale (LogNorm) so "
+                             "changes spanning orders of magnitude are clearer. "
+                             "Non-positive values are ignored; falls back to "
+                             "linear if nothing is positive.")
     parser.add_argument("--animate", action="store_true", default=False,
                         help="Animate over all available (common) timesteps "
                              "instead of plotting a single one")
@@ -606,9 +652,10 @@ if __name__ == "__main__":
         data_t = sim[args.var].values[:, MXG:-MXG, :, args.zindex]
         times = sim["t"].values if "t" in sim.coords else None
 
+        clabel = f"log({args.var})" if args.log else args.var
         anim = animate_plot(fig, ax, rm, zm, data_t, ny_inner, times=times,
-                            cmap=args.cmap, colorbar_label=args.var,
-                            interval=args.interval)
+                            cmap=args.cmap, colorbar_label=clabel,
+                            interval=args.interval, log=args.log)
         if args.branch_cuts:
             plot_branch_cuts(ax, rm, zm, grid, ny_inner)
         if args.seps:
@@ -624,8 +671,9 @@ if __name__ == "__main__":
         fig, ax = plt.subplots(figsize=(6, 10))
         # Single timestep: strip x guard cells, select time and z slice
         data = sim[args.var].values[args.time, MXG:-MXG, :, args.zindex]
+        clabel = f"log({args.var})" if args.log else args.var
         polygon_plot(ax, rm, zm, data, ny_inner,
-                     cmap=args.cmap, colorbar_label=args.var)
+                     cmap=args.cmap, colorbar_label=clabel, log=args.log)
         if args.branch_cuts:
             plot_branch_cuts(ax, rm, zm, grid, ny_inner)
         if args.seps:

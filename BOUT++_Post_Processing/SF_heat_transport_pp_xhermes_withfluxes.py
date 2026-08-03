@@ -69,8 +69,8 @@ MP = 1.672621898e-27   # proton mass [kg]
 GEOM_KEYS     = ["sf_plus",  "hfs_sfm",  "lfs_sfm",  "ideal_sf", "sn",         "sf45",      "sf135"]
 GEOM_LABELS   = ["SF+",      "HFS SF−",  "LFS SF−",  "Ideal SF", "SN",         "SF45",      "SF135"]
 GEOM_METAVARS = ["SF+",      "HFS_SF-",  "LFS_SF-",  "IdealSF",  "SN",         "SF45",      "SF135"]
-COLORS        = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown", "tab:pink"]
-LINESTYLES    = ["-",        "--",       "-.",       ":",        (0, (3, 1, 1, 1)), (0, (5, 1)), (0, (1, 1))]
+COLORS        = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:green", "tab:pink"]
+LINESTYLES    = ["-",        "-",       "-",       ":",        "-", "-", "-"]
 
 TARGET_LABELS = [
     "SP1 – NW target",

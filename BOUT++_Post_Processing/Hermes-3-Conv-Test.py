@@ -129,14 +129,19 @@ def get_omega_ci(sim):
 _DENOM_EPS = 1e-10
 
 
-def convergence_field(sim, var, MXG, zindex, omega_ci, time=None):
+def convergence_field(sim, var, MXG, zindex, omega_ci, time=None,
+                      plot_change=False):
     """
-    Compute the convergence timescale ``var / (ddt(var) * Omega_ci + eps)``.
+    Compute the convergence timescale ``var / (ddt(var) * Omega_ci + eps)``, or
+    its inverse, the fractional rate of change ``(ddt(var) * Omega_ci) / (var +
+    eps)`` when ``plot_change`` is True.
 
     The x guard cells are stripped (``MXG``) and the toroidal index ``zindex`` is
     selected, exactly as in the raw-field plotter. A tiny ``eps`` (``1e-10``) is
-    added to the denominator so cells where ``ddt(var)`` has gone to zero (fully
-    converged) yield a large finite number rather than dividing by zero.
+    added to the denominator so the division never blows up: by default this
+    guards ``ddt(var)`` going to zero (fully converged cells -> large finite
+    timescale); with ``plot_change`` it guards ``var`` going to zero (empty cells
+    -> finite rate).
 
     Parameters
     ----------
@@ -144,6 +149,9 @@ def convergence_field(sim, var, MXG, zindex, omega_ci, time=None):
         If an int, return a single ``(bout_nx, bout_ny)`` frame at that time
         index. If None, return the whole ``(nt, bout_nx, bout_ny)`` series (for
         animation).
+    plot_change : bool
+        If True, return the rate of change ``(ddt(var) * Omega_ci) / var`` [1/s]
+        instead of the timescale ``var / (ddt(var) * Omega_ci)`` [s].
     """
     ddt_name = f"ddt({var})"
     if var not in sim.data_vars:
@@ -161,7 +169,9 @@ def convergence_field(sim, var, MXG, zindex, omega_ci, time=None):
         v = sim[var].values[time, MXG:-MXG, :, zindex]
         d = sim[ddt_name].values[time, MXG:-MXG, :, zindex]
 
-    return v / (d * omega_ci + _DENOM_EPS)
+    if plot_change:
+        return np.abs((d * omega_ci) / (v + _DENOM_EPS))
+    return np.abs(v / (d * omega_ci + _DENOM_EPS))
 
 
 def _build_patches(rm, zm, ny_inner, bout_nx, bout_ny):
@@ -474,6 +484,10 @@ if __name__ == "__main__":
                         help="Use a symmetric-log colour scale so changes across "
                              "orders of magnitude are visible (default: on; "
                              "pass --no-log for a linear scale)")
+    parser.add_argument("--plot_change", action="store_true", default=False,
+                        help="Plot the fractional rate of change "
+                             "(ddt(var)*Omega_ci)/var [1/s] instead of the "
+                             "convergence timescale var/(ddt(var)*Omega_ci) [s].")
     parser.add_argument("--branch_cuts", action="store_true", default=False,
                         help="Overlay the topological branch cuts on the plot")
     parser.add_argument("--seps", action="store_true", default=False,
@@ -498,7 +512,10 @@ if __name__ == "__main__":
     zm = grid["zm"].values
 
     omega_ci = get_omega_ci(sim)
-    label = f"{args.var} / (ddt({args.var})·Omega_ci)  [s]"
+    if args.plot_change:
+        label = f"(ddt({args.var})·Omega_ci) / {args.var}  [1/s]"
+    else:
+        label = f"{args.var} / (ddt({args.var})·Omega_ci)  [s]"
 
     print(f"[Hermes-3-Conv-Test] Selected variable: --var {args.var}")
     print(f"[Hermes-3-Conv-Test] Omega_ci = {omega_ci:.6e} rad/s "
@@ -507,7 +524,8 @@ if __name__ == "__main__":
     if args.animate:
         fig, ax = plt.subplots(figsize=(6, 10))
         data_t = convergence_field(sim, args.var, MXG, args.zindex,
-                                   omega_ci, time=None)
+                                   omega_ci, time=None,
+                                   plot_change=args.plot_change)
         times = sim["t"].values if "t" in sim.coords else None
 
         anim = animate_plot(fig, ax, rm, zm, data_t, ny_inner, times=times,
@@ -527,13 +545,15 @@ if __name__ == "__main__":
     else:
         fig, ax = plt.subplots(figsize=(6, 10))
         data = convergence_field(sim, args.var, MXG, args.zindex,
-                                 omega_ci, time=args.time)
+                                 omega_ci, time=args.time,
+                                 plot_change=args.plot_change)
         polygon_plot(ax, rm, zm, data, ny_inner,
                      cmap=args.cmap, colorbar_label=label, log=args.log)
         if args.branch_cuts:
             plot_branch_cuts(ax, rm, zm, grid, ny_inner)
         if args.seps:
             plot_separatrices(ax, rm, zm, grid, ny_inner)
-        ax.set_title(f"{args.var} convergence (t={args.time}, z={args.zindex})")
+        kind = "rate" if args.plot_change else "convergence"
+        ax.set_title(f"{args.var} {kind} (t={args.time}, z={args.zindex})")
         plt.tight_layout()
         plt.show()

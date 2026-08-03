@@ -35,6 +35,13 @@ Target locations in the BOUT++ double-null poloidal layout (no y-guards frame):
     NE (SP2) : theta = ny_inner - 1
     SE (SP3) : theta = ny_inner + 1
     SW (SP4) : theta = ny - 1
+
+A single-null (SN) has only ONE X-point and therefore only TWO legs, at the
+poloidal-domain ends theta = 0 and theta = ny - 1. It is detected with the
+BOUT++-native test ``jyseps2_1 == jyseps1_2`` (the snowflake grids keep four
+distinct legs and are unaffected). For SN the two legs are hard-coded into the
+NW (slot 0) and NE (slot 1) targets; the SE/SW slots are absent (``None``) so SN
+appears in exactly the first two of the four target panels.
 """
 
 import sys
@@ -49,11 +56,9 @@ import xarray as xr
 import xhermes
 
 # Reuse the INGRID grid-plotting helpers (same routines as visualize_in_grid.py)
-# for the --plot_grids panel, instead of duplicating them here.
-_VIG_DIR = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 "..", "..", "BOUT++_Post_Processing")
-)
+# for the --plot_grids panel, instead of duplicating them here. visualize_in_grid.py
+# now lives alongside this script.
+_VIG_DIR = os.path.dirname(os.path.abspath(__file__))
 if _VIG_DIR not in sys.path:
     sys.path.insert(0, _VIG_DIR)
 try:
@@ -69,8 +74,8 @@ MP = 1.672621898e-27   # proton mass [kg]
 GEOM_KEYS     = ["sf_plus",  "hfs_sfm",  "lfs_sfm",  "ideal_sf", "sn",         "sf45",      "sf135"]
 GEOM_LABELS   = ["SF+",      "HFS SF−",  "LFS SF−",  "Ideal SF", "SN",         "SF45",      "SF135"]
 GEOM_METAVARS = ["SF+",      "HFS_SF-",  "LFS_SF-",  "IdealSF",  "SN",         "SF45",      "SF135"]
-COLORS        = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown", "tab:pink"]
-LINESTYLES    = ["-",        "--",       "-.",       ":",        (0, (3, 1, 1, 1)), (0, (5, 1)), (0, (1, 1))]
+COLORS        = ["tab:blue", "tab:orange", "tab:cyan", "tab:red", "tab:purple", "tab:green", "tab:pink"]
+LINESTYLES    = ["-",        "-",       "-",       ":",        "-", "-", "-"]
 
 TARGET_LABELS = [
     "SP1 – NW target",
@@ -164,7 +169,8 @@ def load_simulation(sim_path, grid_file, t_window=20):
     dict with keys:
         d_sep      : (nx,) distance from primary separatrix at LFS midplane [rho_s0]
         q_0        : reference heat flux n0*Te0*cs0 at separatrix midplane [W/m^2]
-        target_y   : list of 4 poloidal indices [NW, NE, SE, SW] (no-guard frame)
+        target_y   : list of 4 poloidal indices [NW, NE, SE, SW] (no-guard frame);
+                     the NE/SE entries are None for a single-null (only 2 legs)
         topology   : xbout topology string (e.g. upper-disconnected-double-null)
         # per-target lists (each a (nx,) array over the radial index):
         efe_power  : electron POWER through each target face   [W]   (efe_tot_ylow)
@@ -206,6 +212,10 @@ def load_simulation(sim_path, grid_file, t_window=20):
     ny_inner = int(meta["ny_inner"])
     ny       = int(meta["ny"])
     rho_s0   = float(meta["rho_s0"])
+
+    # BOUT++-native single-null test: jyseps2_1 == jyseps1_2 (no upper X-point).
+    # The snowflake grids keep four distinct legs, so only true SN trips this.
+    single_null = int(meta["jyseps2_1"]) == int(meta["jyseps1_2"])
 
     t0 = max(0, min_t - t_window)
     t1 = min_t - 1
@@ -261,13 +271,24 @@ def load_simulation(sim_path, grid_file, t_window=20):
     q_0     = n0 * Te0_J * cs0                # [W/m^2]
 
     # ── Slice the building blocks at each target poloidal index ──────────────
-    target_y = [0, ny_inner - 1, ny_inner + 1, ny - 1]
+    # Canonical 4-slot frame [NW, NE, SE, SW]. A single-null has only the two
+    # legs at the domain ends (theta = 0, ny-1) -> hard-coded into NW and NE
+    # slots; the SE/SW slots are absent (None) and skipped by every consumer.
+    if single_null:
+        # LSN has two legs (theta = 0 and ny-1). Hard-code them into the NW (slot 0)
+        # and NE (slot 1) panels; SE/SW stay absent so they never see this geometry.
+        target_y = [0, ny - 1, None, None]
+        print(f"    Single-null topology (jyseps2_1 == jyseps1_2): "
+              f"only NW (theta=0) and NE (theta={ny - 1}) targets.")
+    else:
+        target_y = [0, ny_inner - 1, ny_inner + 1, ny - 1]
 
     def col(arr2d, yi):
-        return arr2d[:, yi]
+        return None if yi is None else arr2d[:, yi]
 
     return dict(
         d_sep=d_sep, q_0=q_0, target_y=target_y,
+        single_null=single_null,
         topology=meta.get("topology"),
         efe_power=[col(efe, yi) for yi in target_y],
         ion_power=[col(ion, yi) for yi in target_y],
@@ -299,11 +320,13 @@ def print_si_sanity(datasets, labels):
     for d, lab in zip(datasets, labels):
         g = d["MXG"]
         sl = slice(g, -g if g else None)
-        efe_pk = max(np.nanmax(np.abs(a[sl])) for a in d["efe_power"]) / 1e3
-        ion_pk = max(np.nanmax(np.abs(a[sl])) for a in d["ion_power"]) / 1e3
-        pe_pk  = max(np.nanmax(np.abs(a[sl])) for a in d["Pe"])
-        te_pk  = max(np.nanmax(np.abs(a[sl])) for a in d["Te"])
-        ar_pk  = max(np.nanmax(np.abs(a[sl])) for a in d["area"]) * 1e4
+        pk = lambda key: max(np.nanmax(np.abs(a[sl]))
+                             for a in d[key] if a is not None)
+        efe_pk = pk("efe_power") / 1e3
+        ion_pk = pk("ion_power") / 1e3
+        pe_pk  = pk("Pe")
+        te_pk  = pk("Te")
+        ar_pk  = pk("area") * 1e4
         print(f"{lab:<10}{efe_pk:>10.3g}{ion_pk:>10.3g}{pe_pk:>10.3g}"
               f"{te_pk:>10.3g}{ar_pk:>12.3g}{d['q_0']/1e6:>12.3g}")
     print("=" * 78)
@@ -347,6 +370,10 @@ def compute_target_power(data, analytic=False, gamma_e=3.5, gamma_i=3.5):
     q_list, P_list = [], []
     for i in range(4):
         area = data["area"][i]
+        if area is None:                      # absent target (e.g. SN NE/SE slots)
+            q_list.append(None)
+            P_list.append(None)
+            continue
         if analytic:
             mi  = data["ion_AA"] * MP
             Zi  = data["ion_Z"]
@@ -361,12 +388,13 @@ def compute_target_power(data, analytic=False, gamma_e=3.5, gamma_i=3.5):
         q_list.append(q)
         P_list.append(float(np.sum((q * area)[sl])))                  # [W]
 
-    P_total = sum(P_list)
-    data["q"]        = [q / 1e6 for q in q_list]                      # MW/m^2
-    data["q_norm"]   = [q / q_0 for q in q_list]                      # dimensionless
-    data["P_targets"] = [P / 1e6 for P in P_list]                     # MW
+    P_total = sum(P for P in P_list if P is not None)                 # present only
+    data["q"]        = [None if q is None else q / 1e6 for q in q_list]   # MW/m^2
+    data["q_norm"]   = [None if q is None else q / q_0 for q in q_list]   # dimensionless
+    data["P_targets"] = [None if P is None else P / 1e6 for P in P_list]  # MW
     data["P_total"]  = P_total / 1e6                                  # MW
-    data["fractions"] = [100.0 * P / P_total if P_total else 0.0 for P in P_list]
+    data["fractions"] = [None if P is None else (100.0 * P / P_total if P_total else 0.0)
+                         for P in P_list]
     data["approach"] = "C (analytic sheath)" if analytic else "A (energy-flow)"
     return data
 
@@ -381,8 +409,11 @@ def print_power_table(datasets, labels):
     print(f"{'Target':<12}" + "".join(f"{l:>{col}}" for l in labels))
     print("-" * width)
     for ti, short in enumerate(TARGET_SHORT):
-        row = f"{short:<12}" + "".join(f"{d['fractions'][ti]:>{col-1}.1f}%" for d in datasets)
-        print(row)
+        cells = []
+        for d in datasets:
+            frac = d["fractions"][ti]
+            cells.append(f"{'—':>{col}}" if frac is None else f"{frac:>{col-1}.1f}%")
+        print(f"{short:<12}" + "".join(cells))
     print("=" * width)
     print(f"\n{'Total power [MW]':<16}" + "".join(f"{d['P_total']:>{col}.3e}" for d in datasets))
     print(f"{'q_0 [MW/m^2]':<16}"      + "".join(f"{d['q_0']/1e6:>{col}.3e}"   for d in datasets))
@@ -396,8 +427,10 @@ def plot_heat_flux(datasets, labels, colors, lstyles, q_key, ylabel, title, out_
     axes = axes.flatten()
     for ti, (ax, tlabel) in enumerate(zip(axes, TARGET_LABELS)):
         for data, label, color, ls in zip(datasets, labels, colors, lstyles):
+            q = data[q_key][ti]
+            if q is None:                     # target absent for this geometry (SN)
+                continue
             d    = data["d_sep"]
-            q    = data[q_key][ti]
             MXG  = data["MXG"]
             frac = data["fractions"][ti]
             ax.plot(d[MXG:-MXG], q[MXG:-MXG], label=f"{label}  ({frac:.1f}%)",
@@ -445,6 +478,8 @@ def plot_grids(args, out_path):
         print(f"--plot_grids: could not import visualize_in_grid from {_VIG_DIR!r}; "
               "skipping grid plot.")
         return
+    # Same colour per geometry as the heat-flux/bar-chart figures (COLORS keyed by GEOM_KEYS).
+    geom_colors = dict(zip(GEOM_KEYS, COLORS))
     panels = []
     for key, title in GRID_PLOT_ORDER:
         grid = _resolve_grid_for_plot(args, key)
@@ -453,18 +488,23 @@ def plot_grids(args, out_path):
         if not os.path.isfile(grid):
             print(f"--plot_grids: grid file '{grid}' for {title} not found – skipping.")
             continue
-        panels.append((grid, title))
+        panels.append((grid, title, geom_colors.get(key, "steelblue")))
     if not panels:
         print("--plot_grids: no grids available to plot.")
         return
     n = len(panels)
-    fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 9), squeeze=False)
-    axes = axes[0]
-    for ax, (grid, title) in zip(axes, panels):
+    ncols = 4
+    nrows = -(-n // ncols)              # ceil(n / 3) -> 3 columns, 2 rows for 5-6 panels
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 4.8 * nrows),
+                             squeeze=False)
+    axes = axes.flatten()
+    for ax in axes[n:]:                 # blank any unused cells
+        ax.set_axis_off()
+    for ax, (grid, title, color) in zip(axes, panels):
         try:
             ds   = vig.load_grid(grid)
             topo = vig.get_topology_indices(ds)
-            vig.plot_grid_only(ds, topo, ax, edgecolor="steelblue", linewidth=0.3)
+            vig.plot_grid_only(ds, topo, ax, edgecolor=color, linewidth=0.3)
             vig.plot_wall(ds, ax)
             vig.set_axis_style(ax, ds, title=title)
             ds.close()
@@ -473,6 +513,102 @@ def plot_grids(args, out_path):
             ax.set_title(f"{title}\n(failed)")
             ax.set_axis_off()
     fig.suptitle("SF divertor grids", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(out_path + ".pdf", bbox_inches="tight")
+    plt.savefig(out_path + ".png", dpi=150, bbox_inches="tight")
+    print(f"Saved: {out_path}.pdf / .png")
+
+
+# ── Flux-surface / equilibrium profiles (Giacomin Fig. 3 style) ─────────────────
+# These are purely EQUILIBRIUM quantities read from the grid file — independent of
+# the simulation data. rho_s0 only enters to normalise the connection-length axes.
+
+def _read_rho_s0(sim_path):
+    """Read the SI length scale rho_s0 [m] straight from the first dump file."""
+    f = sorted(glob.glob(os.path.join(sim_path, "BOUT.dmp.*.nc")))[0]
+    ds = netCDF4.Dataset(f)
+    val = float(np.array(ds["rho_s0"][...]).flatten()[0])
+    ds.close()
+    return val
+
+
+def compute_flux_surface_profiles(grid_file, rho_s0, mxg=2):
+    """
+    Equilibrium profiles for the Giacomin Fig. 3 panels, from the grid file.
+
+    (a) Safety factor  q(rho_N)   — closed surfaces only.
+        q = |ShiftAngle| / 2*pi. ShiftAngle is the toroidal twist over one full
+        poloidal circuit of a closed flux surface, computed topology-correctly by
+        the grid generator (validated == direct integral of Bt*hthe/(R*Bp) over
+        the inner+outer core loop). This sidesteps the non-standard snowflake
+        jyseps ordering.
+    (b) Magnetic shear  s(rho_N) = (rho_N / q) dq/drho_N.
+    (c) LFS connection length  L_par/rho_s0  vs  (R - R_sep)/rho_s0.
+        L_par = integral of (B/Bp)*hthe*dy from the outboard (max-R) midplane to
+        the LFS target (poloidal index ny_inner-1), on SOL surfaces. Diverges where
+        Bp -> 0 (a secondary X-point on the LFS leg).
+
+    rho_N = sqrt((psi - psi_0)/(psi_sep - psi_0)), psi at the outboard midplane,
+    psi_0 at the innermost core surface, psi_sep at ixseps1.
+
+    Returns dict: rho_N, q, s (core arrays); L_dist, L_par (SOL arrays).
+    """
+    g = netCDF4.Dataset(grid_file)
+    gi = lambda k: int(np.array(g[k][...]).flatten()[0])
+    ix1, ny, nyi, nx = gi("ixseps1"), gi("ny"), gi("ny_inner"), gi("nx")
+    R   = np.array(g["Rxy"][:]);  psi = np.array(g["psixy"][:])
+    Bp  = np.array(g["Bpxy"][:]); B   = np.array(g["Bxy"][:])
+    hthe = np.array(g["hthe"][:]); dy = np.array(g["dy"][:])
+    SA  = np.array(g["ShiftAngle"][:]).flatten()
+    g.close()
+
+    ymid = int(np.argmax(R[ix1, :]))            # outboard (max-R) midplane
+
+    # ── (a) safety factor on closed core surfaces (x = mxg .. ixseps1-1) ─────
+    xc = np.arange(mxg, ix1)
+    q  = np.abs(SA[xc]) / (2.0 * np.pi)
+    psi0, psis = psi[mxg, ymid], psi[ix1, ymid]
+    rho_N = np.sqrt(np.clip((psi[xc, ymid] - psi0) / (psis - psi0), 0.0, None))
+
+    # ── (b) magnetic shear s = (rho_N/q) dq/drho_N ───────────────────────────
+    with np.errstate(divide="ignore", invalid="ignore"):
+        s = rho_N / q * np.gradient(q, rho_N)
+    s = np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # ── (c) LFS connection length on SOL surfaces (x = ixseps1 .. nx-mxg-1) ──
+    xs = np.arange(ix1, nx - mxg)
+    ys = np.arange(ymid, nyi)                   # midplane -> LFS target
+    L_par  = np.array([np.sum((B[x, ys] / Bp[x, ys]) * hthe[x, ys] * dy[x, ys])
+                       for x in xs]) / rho_s0
+    L_dist = (R[xs, ymid] - R[ix1, ymid]) / rho_s0
+
+    return dict(rho_N=rho_N, q=q, s=s, L_dist=L_dist, L_par=L_par)
+
+
+def plot_flux_surface_figure(profiles, labels, colors, lstyles, out_path):
+    """Three-panel figure: (a) <q>, (b) <s> vs rho_N; (c) L_par vs distance."""
+    fig = plt.figure(figsize=(11, 9))
+    gs  = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.1])
+    ax_q = fig.add_subplot(gs[0, 0])
+    ax_s = fig.add_subplot(gs[0, 1])
+    ax_L = fig.add_subplot(gs[1, :])
+
+    for f, label, color, ls in zip(profiles, labels, colors, lstyles):
+        ax_q.plot(f["rho_N"], f["q"], color=color, linestyle=ls, lw=1.8, label=label)
+        ax_s.plot(f["rho_N"], f["s"], color=color, linestyle=ls, lw=1.8, label=label)
+        ax_L.plot(f["L_dist"], f["L_par"], color=color, linestyle=ls, lw=1.8, label=label)
+
+    ax_q.set_xlabel(r"$\rho_N$");           ax_q.set_ylabel(r"$\langle q\rangle_\psi$")
+    ax_s.set_xlabel(r"$\rho_N$");           ax_s.set_ylabel(r"$\langle s\rangle_\psi$")
+    ax_L.set_xlabel(r"Distance from the primary separatrix $(R - R_\mathrm{sep})/\rho_{s0}$")
+    ax_L.set_ylabel(r"Connection length $L_\parallel/\rho_{s0}$")
+    ax_q.set_title("(a) Safety factor", fontsize=11)
+    ax_s.set_title("(b) Magnetic shear", fontsize=11)
+    ax_L.set_title("(c) Low-field side connection length", fontsize=11)
+    for ax in (ax_q, ax_s, ax_L):
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.25)
+
     plt.tight_layout()
     plt.savefig(out_path + ".pdf", bbox_inches="tight")
     plt.savefig(out_path + ".png", dpi=150, bbox_inches="tight")
@@ -511,6 +647,10 @@ def main():
                         help="y-axis limits for the normalised heat-flux plot")
     parser.add_argument("--plot_grids", action="store_true", default=False,
                         help="Plot each supplied grid side by side (grids only).")
+    parser.add_argument("--flux_profiles", action="store_true", default=False,
+                        help="Also produce the equilibrium 3-panel figure: safety "
+                             "factor q(rho_N), magnetic shear s(rho_N), and LFS "
+                             "connection length L_par/rho_s0 (Giacomin Fig. 3 style).")
     args = parser.parse_args()
 
     if args.grid is not None and not os.path.isfile(args.grid):
@@ -583,9 +723,13 @@ def main():
     width = 0.8 / len(datasets)
     for i, (data, label, color) in enumerate(zip(datasets, labels, colors)):
         offset = (i - len(datasets) / 2 + 0.5) * width
-        bars = ax3.bar(x + offset, data["fractions"], width,
+        # Absent targets (e.g. SN NE/SE) -> NaN so no bar is drawn for that slot.
+        heights = [np.nan if f is None else f for f in data["fractions"]]
+        bars = ax3.bar(x + offset, heights, width,
                        label=label, color=color, alpha=0.85)
         for bar, frac in zip(bars, data["fractions"]):
+            if frac is None:
+                continue
             ax3.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                      f"{frac:.1f}%", ha="center", va="bottom", fontsize=7)
     ax3.set_xticks(x)
@@ -599,6 +743,26 @@ def main():
     plt.savefig(out_frac + ".pdf", bbox_inches="tight")
     plt.savefig(out_frac + ".png", dpi=150, bbox_inches="tight")
     print(f"Saved: {out_frac}.pdf / .png")
+
+    # ── Optional Figure 4: equilibrium flux-surface profiles (Giacomin Fig. 3) ─
+    if args.flux_profiles:
+        profiles, fp_labels, fp_colors, fp_lstyles = [], [], [], []
+        for key, label, color, ls in zip(GEOM_KEYS, GEOM_LABELS, COLORS, LINESTYLES):
+            path = getattr(args, key)
+            if path is None or not os.path.isdir(path):
+                continue
+            grid = getattr(args, f"grid_{key}") or args.grid
+            if grid is None or not os.path.isfile(grid):
+                continue
+            try:
+                rho_s0 = _read_rho_s0(path)
+                profiles.append(compute_flux_surface_profiles(grid, rho_s0))
+                fp_labels.append(label); fp_colors.append(color); fp_lstyles.append(ls)
+            except Exception as e:
+                print(f"--flux_profiles: could not build profiles for {label}: {e}")
+        if profiles:
+            plot_flux_surface_figure(profiles, fp_labels, fp_colors, fp_lstyles,
+                                     os.path.join(script_dir, "SF_flux_surface_profiles"))
 
     plt.show()
 
