@@ -55,6 +55,7 @@ detected primary null; stage B then walks to the requested targets
 """
 
 import argparse
+import json
 import re
 from pathlib import Path
 
@@ -73,6 +74,14 @@ from scipy.ndimage import minimum_filter
 HERE = Path(__file__).resolve().parent
 DEFAULT_REF = HERE.parent / "freegs" / "g049467.070005_modified"
 DEFAULT_WALL = HERE.parent / "freegs" / "target_plates" / "simplified_limiter_mastu.txt"
+
+
+def psi_sidecar_path(eqdsk):
+    """Path of the psi-levels sidecar for a g-file: foo.geqdsk -> foo.psi.json.
+    Shared producer (freegs_sf_creator) / consumer (eqdsk_to_ingrid) so the
+    create->grid loop closes without hand-entering INGRID psi levels."""
+    p = Path(eqdsk)
+    return p.with_name(p.stem + ".psi.json")
 
 
 # --------------------------------------------------------------------------
@@ -704,3 +713,16 @@ if __name__ == "__main__":
              f"X2=({sec[0]:.3f},{sec[1]:.3f})")
     plot_file(final, args.wall, out_png, title, targets)
     print(f"  saved {args.out}")
+
+    # psi sidecar: derive the INGRID psi levels from the FINAL file's
+    # limiter-reachable flux spans and write them next to the g-file, so
+    # eqdsk_to_ingrid can grid it with no hand-entered psi levels.  Lazy import
+    # (target_finder imports from this module at top level -> avoid the cycle).
+    from target_finder import recommend_psi_levels
+    wall_xy = np.loadtxt(args.wall, delimiter=",")
+    print("\n  == psi sidecar ==")
+    psi = recommend_psi_levels(final, wall_xy, num_xpt=1 if lsn else 2)
+    sidecar = psi_sidecar_path(args.out)
+    with open(sidecar, "w") as f:
+        json.dump(psi, f, indent=2)
+    print(f"  saved {sidecar}")

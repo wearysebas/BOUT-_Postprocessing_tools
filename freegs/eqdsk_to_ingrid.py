@@ -32,6 +32,7 @@ Usage
     python3 eqdsk_to_ingrid.py file.geqdsk --template base.yml --run
 """
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -41,18 +42,27 @@ matplotlib.use("Agg")
 from matplotlib.path import Path as MplPath
 import yaml
 
-from freegs_sf_creator import parse_geqdsk, lower_xpoints, DEFAULT_WALL
+from freegs_sf_creator import (parse_geqdsk, lower_xpoints, DEFAULT_WALL,
+                               psi_sidecar_path)
 from target_finder import PsiMap, compute_plates, plot_overlay, divertor_legs, trace_leg
 
 # MAST-U divertor search windows (R0, R1, Z0, Z1) for the saddle finder.
 LOWER_WINDOW = (0.4, 1.0, -1.6, -1.05)
 UPPER_WINDOW = (0.4, 1.0, 1.05, 1.6)
 
-# Default strike surface: the simplified MAST-U limiter box.  All these
-# equilibria are meant to grid against this wall (strike_pt_loc=limiter), which
-# sidesteps per-equilibrium target-plate derivation entirely.
-DEFAULT_LIMITER = ("/Users/sruiz/Dev/PhD/Reactors/MAST-U/SF-minus_exact_share/"
-                   "target_plates/simplified_limiter_mastu.txt")
+# Default strike surface: the realistic MAST-U limiter polygon shared by
+# freegs_sf_creator / target_finder (DEFAULT_WALL).  Consistency is essential:
+# the SAME wall must feed (a) the psi sidecar's limiter-reachable spans, (b) the
+# on-limiter plate carving, and (c) the grid, or the plates won't cover what
+# INGRID traces.  (The legacy 5-point rectangular box under Reactors/MAST-U/
+# SF-minus_exact_share dips to psiN~1.004 along its flat bottom between the
+# snowflake nulls, starving the W2/E2 plates and stalling the tracer.)
+DEFAULT_LIMITER = str(DEFAULT_WALL)
+
+# INGRID package root used for --run/--tool imports.  Must be the build that
+# supports the keys this pipeline emits (remove_upper_divertor) -- INGRID_Final,
+# NOT the default-importable Ingrid_fixed (which rejects remove_upper_divertor).
+DEFAULT_INGRID_ROOT = "/Users/sruiz/Dev/PhD/INGRID_Final/INGRID"
 
 
 def nulls_in_band(d, pm, window, lo, hi, ntop=2):
@@ -466,6 +476,9 @@ def main():
                     help="override primary private-flux psiN (yaml psi_pf_1)")
     ap.add_argument("--psi-pf2", type=float, default=None,
                     help="override secondary private-flux psiN (yaml psi_pf_2)")
+    ap.add_argument("--no-sidecar", action="store_true",
+                    help="ignore the <eqdsk>.psi.json sidecar (limiter-derived "
+                         "psi levels from freegs_sf_creator); use template/CLI only")
     ap.add_argument("--plates-dir", default=None,
                     help="directory holding the (fixed, machine-geometry) "
                          "W1/E1[/W2/E2]_target.txt tile files "
@@ -487,6 +500,10 @@ def main():
     ap.add_argument("--plate-points", type=int, default=2,
                     help="[--auto-plates] points per plate; 2 = the developer's "
                          "straight-line route (psi_pf/psi_sol endpoints only)")
+    ap.add_argument("--float-plates", action="store_true",
+                    help="[--auto-plates] float perpendicular plates a back-off "
+                         "inside the wall instead of carving them onto the "
+                         "limiter (default is on-limiter for SN and snowflake)")
     ap.add_argument("--xpt-tol", type=float, default=0.05,
                     help="lower psiN tolerance (1-tol) for counting a saddle as "
                          "an active divertor X-point; the upper bound is psi_1")
@@ -512,8 +529,11 @@ def main():
     ap.add_argument("--patch-timeout", type=float, default=120.0,
                     help="[--tune] seconds before a candidate's CreatePatches "
                          "test is killed")
-    ap.add_argument("--ingrid-root", default=None,
-                    help="path to the INGRID package root (for --run imports)")
+    ap.add_argument("--ingrid-root", default=DEFAULT_INGRID_ROOT,
+                    help="path to the INGRID package root (for --run/--tune "
+                         "imports). Defaults to INGRID_Final, which supports the "
+                         "remove_upper_divertor key this pipeline emits; the "
+                         "default-importable Ingrid_fixed does not.")
     args = ap.parse_args()
 
     eqdsk_path = Path(args.eqdsk).resolve()
@@ -529,12 +549,29 @@ def main():
         template = yaml.safe_load(f)
     tgs = template.get("grid_settings", {})
 
-    # psi levels: template defaults, CLI overrides (single source of truth)
+    # psi sidecar (foo.psi.json next to the g-file): the limiter-derived levels
+    # freegs_sf_creator wrote.  Loaded if present unless --no-sidecar.
+    side = {}
+    sidecar = psi_sidecar_path(eqdsk_path)
+    if not args.no_sidecar and sidecar.exists():
+        with open(sidecar) as f:
+            side = json.load(f)
+        print(f"psi sidecar: {sidecar} -> {side}")
+
+    # psi levels, precedence CLI override > sidecar > template (single source of
+    # truth: whatever lands here is also handed to the plate builder)
+    def pick(cli, key):
+        if cli is not None:
+            return cli
+        if key in side:
+            return side[key]
+        return tgs.get(key)
+
     psi = {
-        "psi_1":    args.psi_1    if args.psi_1    is not None else tgs.get("psi_1"),
-        "psi_core": args.psi_core if args.psi_core is not None else tgs.get("psi_core"),
-        "psi_pf_1": args.psi_pf1  if args.psi_pf1  is not None else tgs.get("psi_pf_1"),
-        "psi_pf_2": args.psi_pf2  if args.psi_pf2  is not None else tgs.get("psi_pf_2"),
+        "psi_1":    pick(args.psi_1,    "psi_1"),
+        "psi_core": pick(args.psi_core, "psi_core"),
+        "psi_pf_1": pick(args.psi_pf1,  "psi_pf_1"),
+        "psi_pf_2": pick(args.psi_pf2,  "psi_pf_2"),
     }
     if psi["psi_1"] is None or psi["psi_pf_1"] is None:
         raise SystemExit("psi_1 and psi_pf_1 must come from the template or "
@@ -573,12 +610,13 @@ def main():
                     (secondary, primary, "2", psi_pf_lo))
         else:
             jobs = ((primary, None, "1", psi_pf_lo),)
-        # single-null: carve the plates out of the limiter so the grid ends on
-        # the physical boundary (target_finder.build_plate_on_limiter); the
-        # snowflake path keeps the perpendicular plates (on_limiter defaults off)
+        # carve every plate out of the limiter so the grid ends on the physical
+        # boundary (target_finder.build_plate_on_limiter) -- single-null AND
+        # snowflake now share this convention; --float-plates restores the old
+        # floating perpendicular plates for debugging
         plates = compute_plates(pm, axis, jobs, psi["psi_1"], args.margin,
                                 limiter, outdir, npts=args.plate_points,
-                                wall=wall, on_limiter=(num_xpt == 1))
+                                wall=wall, on_limiter=not args.float_plates)
         plot_overlay(d, wall, labels, plates, psi["psi_1"], outdir,
                      f"eqdsk_to_ingrid: {eqdsk_path.name}")
         plate_files = {name: outdir / f"{name}_target.txt" for name in plates}

@@ -301,8 +301,27 @@ def write_plate(fn, pts):
 # --------------------------------------------------------------------------
 # reusable plate factory + overlay (shared with eqdsk_to_ingrid.py)
 # --------------------------------------------------------------------------
+def _onlimiter_grazes(pm, pts, leg):
+    """Grazing test for an on-limiter plate: cos of the angle between the plate
+    chord (PF endpoint -> SOL endpoint) and grad(psi) at the strike.
+
+    ~1 when the chord climbs straight up the flux gradient (a clean crossing);
+    ~0 when the wall runs PARALLEL to the flux surfaces at the strike, so the
+    plate has to wrap a long arc to span [psi_pf, psi_sol].  Such a wrapping
+    plate (e.g. the SF-plus secondary-East leg, which strikes the grazing
+    secondary-lobe wall) makes the outer divertor patch's radial line
+    non-monotonic and crashes INGRID's ConstructGrid ('PsiW is not monotonic').
+    For those legs `compute_plates` falls back to the float perpendicular plate.
+    """
+    chord = np.asarray(pts[-1], float) - np.asarray(pts[0], float)
+    chord /= (np.linalg.norm(chord) + 1e-30)
+    g = pm.grad(*np.asarray(leg[-1], float))
+    g /= (np.linalg.norm(g) + 1e-30)
+    return abs(float(chord @ g))
+
+
 def compute_plates(pm, axis, jobs, psi_sol, margin, limiter, outdir, npts=2,
-                   wall=None, on_limiter=False):
+                   wall=None, on_limiter=False, graze_tol=0.85):
     """Trace divertor legs and write INGRID target-plate files.
 
     `jobs` is an iterable of ``(null, other_or_None, tag, psi_pf)`` tuples; for
@@ -317,9 +336,12 @@ def compute_plates(pm, axis, jobs, psi_sol, margin, limiter, outdir, npts=2,
     it for a curved plate that follows the leg's local geometry more closely.
 
     With ``on_limiter=True`` (and `wall` given, the ordered limiter polygon),
-    plates are instead carved out of the limiter so the grid ends on the
-    physical boundary -- see `build_plate_on_limiter`.  Used for the single-null
-    route; the default (False) leaves the snowflake plates unchanged.
+    plates are carved out of the limiter so the grid ends on the physical
+    boundary (`build_plate_on_limiter`) -- the default for both single-null and
+    snowflake.  EXCEPTION: a leg whose on-limiter plate would GRAZE the wall
+    (chord vs grad-psi cosine below `graze_tol`, e.g. the SF-plus secondary-East
+    leg on the secondary-lobe wall) wraps a long arc and breaks ConstructGrid;
+    that leg falls back to the float perpendicular plate (`build_plate`).
     """
     plates = {}
     for null, other, tag, psi_pf in jobs:
@@ -332,6 +354,13 @@ def compute_plates(pm, axis, jobs, psi_sol, margin, limiter, outdir, npts=2,
             if on_limiter and wall is not None:
                 pts, anchor, span = build_plate_on_limiter(
                     pm, leg, wall, psi_pf, psi_sol, margin, npts=npts)
+                cos = _onlimiter_grazes(pm, pts, leg)
+                if cos < graze_tol:                       # wall grazes the flux
+                    print(f"  {we}{tag}: on-limiter plate grazes the wall "
+                          f"(|chord.gradpsi|={cos:.2f} < {graze_tol}) -- using a "
+                          "float perpendicular plate instead")
+                    pts, anchor, span = build_plate(pm, leg, psi_pf, psi_sol,
+                                                    margin, npts=npts)
             else:
                 pts, anchor, span = build_plate(pm, leg, psi_pf, psi_sol,
                                                 margin, npts=npts)
@@ -343,6 +372,94 @@ def compute_plates(pm, axis, jobs, psi_sol, margin, limiter, outdir, npts=2,
             print(f"  {name}: strike R={anchor[0]:.4f} Z={anchor[1]:+.4f}  "
                   f"psiN span [{span[0]:.4f}, {span[1]:.4f}]  {ok}  -> {fn.name}")
     return plates
+
+
+def recommend_psi_levels(d, wall, num_xpt=None, primary_pref="auto",
+                         margin=0.012, sol_buffer=0.012, psi_core=0.85,
+                         probe_pf=0.90, probe_sol=1.10):
+    """Derive grid-safe INGRID psi levels from the limiter-reachable flux spans.
+
+    INGRID traces the SOL out to ``psi_1`` and the private flux down to
+    ``psi_pf``; if either level lies OUTSIDE what the wall can reach along a leg,
+    that leg's trace slips past the plate to the domain boundary ("one of the
+    targets does not intersect one of the field lines").  This walks each
+    divertor leg's plate ALONG the limiter (`build_plate_on_limiter`) with
+    deliberately-unreachable probe targets, so the walk stops at the wall's true
+    psiN valley (PF) / ridge (SOL) and reports the reachable span.  Grid-safe
+    levels then sit ``margin`` INSIDE the tightest reachable extreme:
+
+      psi_1    = min(SOL reach over all legs)   - margin   (every leg reaches it)
+      psi_pf_1 = max(PF  reach over primary legs)   + margin
+      psi_pf_2 = max(PF  reach over secondary legs) + margin   (snowflake only)
+      psi_core = fixed (core depth is not limiter-constrained)
+
+    Returns a dict of the ``grid_settings`` psi keys (psi_pf_2 only for a
+    snowflake).  Mirrors the primary/secondary choice in `main()` (auto = psiN
+    closest to 1).  Single source of truth for the create->grid loop: the same
+    spans feed the plate builder, so plates always cover exactly what's traced.
+    """
+    pm = PsiMap(d)
+    limiter = MplPath(wall)
+    xs = lower_xpoints(d, ntop=1 if num_xpt == 1 else 2)
+    if num_xpt is None:
+        num_xpt = len(xs)
+    axis = (d["rmaxis"], d["zmaxis"])
+
+    if num_xpt == 1 or len(xs) < 2:
+        primary, secondary = xs[0], None
+        jobs = ((primary, None, "1"),)
+    else:
+        xs.sort(key=lambda p: p[0])                       # inboard (left) first
+        left, right = xs[0], xs[1]
+        if primary_pref == "left":
+            primary, secondary = left, right
+        elif primary_pref == "right":
+            primary, secondary = right, left
+        else:                                             # auto: psiN closest to 1
+            primary, secondary = (
+                (right, left) if abs(pm.psin(*right) - 1) <= abs(pm.psin(*left) - 1)
+                else (left, right))
+        jobs = ((primary, secondary, "1"), (secondary, primary, "2"))
+
+    sol_reach, pf_reach = [], {"1": [], "2": []}
+    for null, other, tag in jobs:
+        legs = divertor_legs(pm, null, other, axis, limiter)
+        legs.sort(key=lambda pth: pth[-1][0])             # West = lower-R strike
+        for leg in legs[:2]:
+            _, _, span = build_plate_on_limiter(
+                pm, leg, wall, probe_pf, probe_sol, margin=0.0)
+            pf_reach[tag].append(span[0])
+            sol_reach.append(span[1])
+
+    psi_1 = round(min(sol_reach) - margin, 4)
+    # keep a snowflake-plus secondary null (psiN > 1, sitting in the primary SOL)
+    # inside the gridded SOL band
+    if secondary is not None and pm.psin(*secondary) > 1.0:
+        need = round(pm.psin(*secondary) + sol_buffer, 4)
+        if need > psi_1:
+            print(f"  note: secondary null psiN={pm.psin(*secondary):.4f} > psi_1;"
+                  f" raising psi_1 {psi_1} -> {need} to enclose it")
+            psi_1 = need
+
+    psi = {"psi_1": psi_1, "psi_core": psi_core,
+           "psi_pf_1": round(max(pf_reach["1"]) + margin, 4)}
+    if secondary is not None:
+        # SF-plus (secondary null INSIDE the primary separatrix, psiN < 1): its
+        # secondary divertor's "private flux" actually lies on the SOL side, so
+        # psi_pf_2 mirrors psi_1 (INGRID's SF+ convention; a sub-separatrix
+        # psi_pf_2 here traces a degenerate inter-null PF pocket and stalls the
+        # tracer -- validated on sf75_test).  SF-minus keeps the limiter value.
+        if pm.psin(*secondary) < 1.0:
+            psi["psi_pf_2"] = psi_1
+            print(f"  note: SF-plus secondary (psiN={pm.psin(*secondary):.4f} < 1)"
+                  f" -- psi_pf_2 mirrors psi_1 ({psi_1})")
+        else:
+            psi["psi_pf_2"] = round(max(pf_reach["2"]) + margin, 4)
+
+    print(f"  recommended psi levels (limiter-reachable, margin {margin}):")
+    for k, v in psi.items():
+        print(f"    {k}: {v}")
+    return psi
 
 
 def plot_overlay(d, wall, nulls_labeled, plates, psi_sol, outdir, title):
@@ -405,6 +522,10 @@ def main():
     ap.add_argument("--plate-points", type=int, default=2,
                     help="points per plate; 2 = the developer's straight-line "
                          "route (just the psi_pf/psi_sol endpoints)")
+    ap.add_argument("--float-plates", action="store_true",
+                    help="float perpendicular plates a back-off inside the wall "
+                         "instead of carving them onto the limiter (default is "
+                         "on-limiter for BOTH single-null and snowflake)")
     ap.add_argument("--outdir", default=None,
                     help="output dir (default <eqdsk dir>/target_plates_auto)")
     args = ap.parse_args()
@@ -454,7 +575,7 @@ def main():
 
     plates = compute_plates(pm, axis, jobs, args.psi_sol, args.margin,
                             limiter, outdir, npts=args.plate_points,
-                            wall=wall, on_limiter=args.single_null)
+                            wall=wall, on_limiter=not args.float_plates)
 
     plot_overlay(d, wall, labels, plates,
                  args.psi_sol, outdir, f"target_finder: {Path(args.eqdsk).name}")

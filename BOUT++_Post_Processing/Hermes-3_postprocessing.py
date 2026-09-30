@@ -156,7 +156,7 @@ def open_aligned_boutdataset(datapath, **kwargs):
     return xbout.open_boutdataset(datapath=datasets, **kwargs)
 
 
-def _build_patches(rm, zm, ny_inner, bout_nx, bout_ny):
+def _build_patches(rm, zm, ny_inner, bout_nx, bout_ny, bridge_cut=False):
     """
     Build the polygon patches and their (bout_i, bout_j) data indices by
     iterating over the raw gridue cells.
@@ -190,6 +190,12 @@ def _build_patches(rm, zm, ny_inner, bout_nx, bout_ny):
     ii, jj : np.ndarray
         Index arrays such that ``data[ii, jj]`` gives the colour for each patch,
         for ``data`` of shape ``(bout_nx, bout_ny)``.
+
+    ``bridge_cut`` closes the two poloidal guard columns at the ny_inner branch
+    cut by colouring them from their neighbouring interior cells. Only pass True
+    for a single null (``jyseps2_1 == jyseps1_2``), where that cut is a
+    continuous top-of-domain location; for a double null / snowflake it is a
+    real inner/outer target break and must stay open.
     """
     Nx_gridue = rm.shape[0]
     Ny_gridue = rm.shape[1]
@@ -232,6 +238,36 @@ def _build_patches(rm, zm, ny_inner, bout_nx, bout_ny):
             patches.append(p)
             ii.append(bout_i)
             jj.append(bout_j)
+
+    # ------------------------------------------------------------------
+    # Branch-cut guard columns (close the top-of-domain wedge gap) — single
+    # null only (bridge_cut).
+    #
+    # The two poloidal guard cells at the ny_inner branch cut
+    # (gridue i = ny_inner+1, ny_inner+2) are skipped by the mapping above
+    # because they carry no evolved data. In a single-null grid this cut sits at
+    # the top of the poloidal domain where the plasma is poloidally continuous,
+    # so dropping them leaves the visible wedge-shaped hole reported for LSN
+    # plots. Bridge it: draw each guard column and colour it from its adjacent
+    # interior column (inner guard from bout_j = ny_inner-1, outer guard from
+    # bout_j = ny_inner). Mirrors the branch-cut handling in visualize_in_grid.py.
+    # NOT done for double-null / snowflake, where ny_inner is a real target break.
+    gi_in, gi_out = ny_inner + 1, ny_inner + 2
+    bj_in, bj_out = ny_inner - 1, ny_inner
+    if bridge_cut and gi_out < Nx_gridue and 0 <= bj_in < bout_ny and 0 <= bj_out < bout_ny:
+        for j in range(1, Ny_gridue - 1):
+            bout_i = j + 1
+            if bout_i < 0 or bout_i >= bout_nx:
+                continue
+            for gi, bj in ((gi_in, bj_in), (gi_out, bj_out)):
+                p = matplotlib.patches.Polygon(
+                    np.concatenate((rm[gi][j][idx], zm[gi][j][idx])).reshape(2, 5).T,
+                    fill=True,
+                    closed=True,
+                )
+                patches.append(p)
+                ii.append(bout_i)
+                jj.append(bj)
 
     return patches, np.array(ii), np.array(jj)
 
@@ -445,7 +481,8 @@ def _decorate_axes(ax, rm, zm):
 
 
 def polygon_plot(ax, rm, zm, data, ny_inner, cmap="viridis",
-                 vmin=None, vmax=None, colorbar_label=None, log=False):
+                 vmin=None, vmax=None, colorbar_label=None, log=False,
+                 bridge_cut=False):
     """
     Create a 2D polygon plot by iterating over raw gridue cells.
 
@@ -455,7 +492,8 @@ def polygon_plot(ax, rm, zm, data, ny_inner, cmap="viridis",
     changes spanning several orders of magnitude easier to read.
     """
     bout_nx, bout_ny = data.shape
-    patches, ii, jj = _build_patches(rm, zm, ny_inner, bout_nx, bout_ny)
+    patches, ii, jj = _build_patches(rm, zm, ny_inner, bout_nx, bout_ny,
+                                     bridge_cut=bridge_cut)
 
     colors = data[ii, jj]
     norm = _make_norm(colors, log, vmin, vmax)
@@ -476,7 +514,8 @@ def polygon_plot(ax, rm, zm, data, ny_inner, cmap="viridis",
 
 
 def animate_plot(fig, ax, rm, zm, data_t, ny_inner, times=None,
-                 cmap="viridis", colorbar_label=None, interval=200, log=False):
+                 cmap="viridis", colorbar_label=None, interval=200, log=False,
+                 bridge_cut=False):
     """
     Animate the polygon plot over every available timestep.
 
@@ -500,7 +539,8 @@ def animate_plot(fig, ax, rm, zm, data_t, ny_inner, times=None,
     from matplotlib.animation import FuncAnimation
 
     nt, bout_nx, bout_ny = data_t.shape
-    patches, ii, jj = _build_patches(rm, zm, ny_inner, bout_nx, bout_ny)
+    patches, ii, jj = _build_patches(rm, zm, ny_inner, bout_nx, bout_ny,
+                                     bridge_cut=bridge_cut)
 
     # Fixed colour normalization across the whole time series (built from the
     # only cells that are actually drawn, so the log floor isn't dragged down by
@@ -557,7 +597,7 @@ if __name__ == "__main__":
     parser.add_argument("sim_results", type=str,
                         help="Path to simulation results directory")
     parser.add_argument("--var", type=str, default=None,
-                        help="Variable to plot (default: T). With "
+                        help="Variable to plot (default: Te). With "
                              "--test_convergence, specifying --var reports only "
                              "that variable; omitting it reports the whole list.")
     parser.add_argument("--time", type=int, default=-1,
@@ -615,12 +655,22 @@ if __name__ == "__main__":
     # convergence report.
     var_specified = args.var is not None
     if args.var is None:
-        args.var = "T"
+        args.var = "Te"
 
     MXG = sim.metadata["MXG"]
     nx = int(grid["nx"].values)
     ny = int(grid["ny"].values)
     ny_inner = int(grid["ny_inner"].values)
+
+    # Single-null signature: the two X-point poloidal indices coincide, so the
+    # ny_inner branch cut is a continuous top-of-domain location that should be
+    # bridged (see _build_patches). For a double null / snowflake it is a real
+    # inner/outer target break and is left open.
+    bridge_cut = ("jyseps2_1" in grid and "jyseps1_2" in grid
+                  and int(grid["jyseps2_1"].values) == int(grid["jyseps1_2"].values))
+    if bridge_cut:
+        print("[Hermes-3_postprocessing] Single-null grid (jyseps2_1 == jyseps1_2): "
+              "bridging the ny_inner branch cut to close the top wedge gap.")
 
     # Raw gridue cell corners from grid file
     rm = grid["rm"].values  # (Nx_gridue, Ny_gridue, 5)
@@ -655,7 +705,8 @@ if __name__ == "__main__":
         clabel = f"log({args.var})" if args.log else args.var
         anim = animate_plot(fig, ax, rm, zm, data_t, ny_inner, times=times,
                             cmap=args.cmap, colorbar_label=clabel,
-                            interval=args.interval, log=args.log)
+                            interval=args.interval, log=args.log,
+                            bridge_cut=bridge_cut)
         if args.branch_cuts:
             plot_branch_cuts(ax, rm, zm, grid, ny_inner)
         if args.seps:
@@ -673,7 +724,8 @@ if __name__ == "__main__":
         data = sim[args.var].values[args.time, MXG:-MXG, :, args.zindex]
         clabel = f"log({args.var})" if args.log else args.var
         polygon_plot(ax, rm, zm, data, ny_inner,
-                     cmap=args.cmap, colorbar_label=clabel, log=args.log)
+                     cmap=args.cmap, colorbar_label=clabel, log=args.log,
+                     bridge_cut=bridge_cut)
         if args.branch_cuts:
             plot_branch_cuts(ax, rm, zm, grid, ny_inner)
         if args.seps:
