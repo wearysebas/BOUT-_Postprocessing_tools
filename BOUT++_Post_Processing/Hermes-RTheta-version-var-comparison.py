@@ -39,15 +39,21 @@ POLOIDAL = {"theta", "y"}
 # ---------------------------------------------------------------------------
 
 def _list_vars(path):
-    dmp = sorted(Path(path).glob("BOUT.dmp.*.nc"))
+    dmp = sorted(Path(path).glob("BOUT.squash.nc")) or sorted(Path(path).glob("BOUT.dmp.*.nc"))
     if not dmp:
         raise FileNotFoundError(f"No BOUT.dmp.*.nc files in {path}")
     with DataFile(str(dmp[0])) as f:
         return set(f.list())
 
 
+def _collect(name, path, **kwargs):
+    if Path(path, "BOUT.squash.nc").exists():
+        return collect(name, path=path, prefix="BOUT.squash", yguards=True, **kwargs)
+    return collect(name, path=path, **kwargs)
+
+
 def collect_full(name, path):
-    return np.asarray(collect(name, path=path, info=False, strict=True))
+    return np.asarray(_collect(name, path, info=False, strict=True))
 
 
 def collect_time_slice(name, path, tind):
@@ -109,7 +115,7 @@ def get_grid_rtheta(grid_path):
 
 def get_t_array(path):
     if "t_array" in _list_vars(path):
-        return np.asarray(collect("t_array", path=path, info=False, strict=True))
+        return np.asarray(_collect("t_array", path, info=False, strict=True))
     return None
 
 

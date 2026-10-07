@@ -19,6 +19,7 @@ Example:
 """
 
 import numpy as np
+import os
 import xarray as xr
 import xbout
 import matplotlib
@@ -116,7 +117,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     grid = xr.open_dataset(args.grid_file, engine="netcdf4")
-    sim = xbout.open_boutdataset(args.sim_results + "/BOUT.dmp.*.nc")
+    squash = os.path.join(args.sim_results, "BOUT.squash.nc")
+    sim = xbout.open_boutdataset(squash if os.path.exists(squash)
+                                 else args.sim_results + "/BOUT.dmp.*.nc")
 
     MXG = sim.metadata["MXG"]
     ny_inner = int(grid["ny_inner"].values)

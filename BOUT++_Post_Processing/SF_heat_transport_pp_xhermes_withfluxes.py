@@ -69,7 +69,7 @@ MP = 1.672621898e-27   # proton mass [kg]
 GEOM_KEYS     = ["sf_plus",  "hfs_sfm",  "lfs_sfm",  "ideal_sf", "sn",         "sf45",      "sf135"]
 GEOM_LABELS   = ["SF+",      "HFS SF−",  "LFS SF−",  "Ideal SF", "SN",         "SF45",      "SF135"]
 GEOM_METAVARS = ["SF+",      "HFS_SF-",  "LFS_SF-",  "IdealSF",  "SN",         "SF45",      "SF135"]
-COLORS        = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:green", "tab:pink"]
+COLORS        = ["tab:blue", "tab:orange", "tab:cyan", "tab:red", "tab:purple", "tab:green", "tab:pink"]
 LINESTYLES    = ["-",        "-",       "-",       ":",        "-", "-", "-"]
 
 TARGET_LABELS = [
@@ -83,6 +83,13 @@ TARGET_SHORT = ["SP1 (NW)", "SP2 (NE)", "SP3 (SE)", "SP4 (SW)"]
 
 # ── Time handling ──────────────────────────────────────────────────────────────
 
+def _dump_pattern(sim_path):
+    squash = os.path.join(sim_path, "BOUT.squash.nc")
+    if os.path.exists(squash):
+        return squash
+    return os.path.join(sim_path, "BOUT.dmp.*.nc")
+
+
 def _common_nt(sim_path):
     """
     Largest number of output steps present in *every* BOUT.dmp file.
@@ -92,7 +99,7 @@ def _common_nt(sim_path):
     loader. We clip the time window to the last common step. Returns
     ``(min_t, max_t, nfiles)``.
     """
-    files = sorted(glob.glob(os.path.join(sim_path, "BOUT.dmp.*.nc")))
+    files = sorted(glob.glob(_dump_pattern(sim_path)))
     if not files:
         raise FileNotFoundError(f"No BOUT.dmp.*.nc files found in {sim_path!r}")
     tlens = []
@@ -195,8 +202,9 @@ def load_simulation(sim_path, grid_file, t_window=20):
     # (default) so the poloidal frame matches the grid (no y-guards). The corner
     # mesh (rm/zm) is kept aside for real-space plotting.
     field_grid, corner_mesh = _open_clean_grid(grid_file)
-    ds = xhermes.open(sim_path, geometry="toroidal",
-                      gridfilepath=field_grid, info=False)
+    ds = xhermes.open_hermesdataset(datapath=_dump_pattern(sim_path),
+                                    inputfilepath=os.path.join(sim_path, "BOUT.settings"),
+                                    geometry="toroidal", gridfilepath=field_grid, info=False)
     ds = ds.isel(t=slice(0, min_t))
 
     meta   = ds.metadata
@@ -485,7 +493,7 @@ def plot_grids(args, out_path):
 
 def _read_rho_s0(sim_path):
     """Read the SI length scale rho_s0 [m] straight from the first dump file."""
-    f = sorted(glob.glob(os.path.join(sim_path, "BOUT.dmp.*.nc")))[0]
+    f = sorted(glob.glob(_dump_pattern(sim_path)))[0]
     ds = netCDF4.Dataset(f)
     val = float(np.array(ds["rho_s0"][...]).flatten()[0])
     ds.close()

@@ -16,18 +16,24 @@ from boututils.datafile import DataFile
 
 def list_variables(path):
     """Return the sorted list of variable names in a BOUT++ dump directory."""
-    dmp_files = sorted(Path(path).glob("BOUT.dmp.*.nc"))
+    dmp_files = sorted(Path(path).glob("BOUT.squash.nc")) or sorted(Path(path).glob("BOUT.dmp.*.nc"))
     if not dmp_files:
         raise FileNotFoundError(f"No BOUT.dmp.*.nc files found in {path}")
     with DataFile(str(dmp_files[0])) as f:
         return sorted(f.list())
 
 
+def _collect(name, path, **kwargs):
+    if Path(path, "BOUT.squash.nc").exists():
+        return collect(name, path=path, prefix="BOUT.squash", yguards=True, **kwargs)
+    return collect(name, path=path, **kwargs)
+
+
 def compare_variable(name, path_a, path_b, rtol, atol):
     """Collect `name` from both runs and compare element-wise."""
     try:
-        a = collect(name, path=path_a, info=False, strict=True)
-        b = collect(name, path=path_b, info=False, strict=True)
+        a = _collect(name, path_a, info=False, strict=True)
+        b = _collect(name, path_b, info=False, strict=True)
     except Exception as exc:
         return "ERROR", f"collect failed: {exc}"
 

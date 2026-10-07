@@ -138,6 +138,23 @@ def _load_pp(explicit=None):
 # Loading
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _dump_pattern(sim_path):
+    squash = os.path.join(sim_path, "BOUT.squash.nc")
+    if os.path.exists(squash):
+        return squash
+    return os.path.join(sim_path, "BOUT.dmp.*.nc")
+
+
+def _open_run(sim_path, keep_yboundaries=False, **kwargs):
+    name = "BOUT.squash_with_guard_cells.nc" if keep_yboundaries else "BOUT.squash.nc"
+    squash = os.path.join(sim_path, name)
+    if os.path.exists(squash):
+        return xhermes.open_hermesdataset(
+            datapath=squash, inputfilepath=os.path.join(sim_path, "BOUT.settings"),
+            keep_yboundaries=keep_yboundaries, **kwargs)
+    return xhermes.open(sim_path, keep_yboundaries=keep_yboundaries, **kwargs)
+
+
 def _common_nt(sim_path):
     """
     Largest number of output steps present in *every* BOUT.dmp file.
@@ -146,7 +163,7 @@ def _common_nt(sim_path):
     same number of steps; reading a step a short rank never wrote crashes the
     combine. Returns ``(min_t, max_t, nfiles)``.
     """
-    files = sorted(glob.glob(os.path.join(sim_path, "BOUT.dmp.*.nc")))
+    files = sorted(glob.glob(_dump_pattern(sim_path)))
     if not files:
         raise FileNotFoundError(f"No BOUT.dmp.*.nc files found in {sim_path!r}")
     tlens = []
@@ -267,7 +284,7 @@ def load_run(sim_path, grid_file, twindow=20):
     field_grid = _open_clean_grid(grid_file)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ds = xhermes.open(sim_path, geometry="toroidal",
+        ds = _open_run(sim_path, geometry="toroidal",
                           gridfilepath=field_grid, info=False)
     ds = ds.isel(t=slice(0, min_t))
 
@@ -275,7 +292,7 @@ def load_run(sim_path, grid_file, twindow=20):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            dsg = xhermes.open(sim_path, info=False, keep_yboundaries=True)
+            dsg = _open_run(sim_path, info=False, keep_yboundaries=True)
         dsg = dsg.isel(t=slice(0, min_t))
     except Exception as exc:                              # pragma: no cover
         print(f"[{BANNER}] Could not open a y-guarded view ({exc}); "

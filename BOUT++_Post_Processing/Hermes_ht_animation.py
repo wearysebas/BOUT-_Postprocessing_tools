@@ -24,6 +24,7 @@ Example
 
 import argparse
 import numpy as np
+import os
 import xarray as xr
 import xbout
 import matplotlib
@@ -166,8 +167,9 @@ def main():
     # sim y-extent shorter than the polygon grid and the lookup runs off the
     # end of the array.
     print("Opening simulation dataset...")
+    squash = os.path.join(args.sim_results, "BOUT.squash.nc")
     sim = xbout.open_boutdataset(
-        args.sim_results + "/BOUT.dmp.*.nc",
+        squash if os.path.exists(squash) else args.sim_results + "/BOUT.dmp.*.nc",
         keep_yboundaries=True,
     )
 

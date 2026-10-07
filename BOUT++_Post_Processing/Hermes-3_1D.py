@@ -122,7 +122,8 @@ def common_tlen(path):
     some rank never wrote. Returns ``None`` if no time axis is present (static
     grid-only data) or the dump files can't be inspected.
     """
-    files = sorted(glob.glob(os.path.join(path, "BOUT.dmp.*.nc")), key=_proc_index)
+    files = (glob.glob(os.path.join(path, "BOUT.squash.nc"))
+             or sorted(glob.glob(os.path.join(path, "BOUT.dmp.*.nc")), key=_proc_index))
     if not files:
         return None
 
@@ -148,6 +149,12 @@ def common_tlen(path):
     return min_t
 
 
+def _collect(name, path, **kwargs):
+    if os.path.exists(os.path.join(path, "BOUT.squash.nc")):
+        return collect(name, path=path, prefix="BOUT.squash", yguards=True, **kwargs)
+    return collect(name, path=path, **kwargs)
+
+
 def collect_var(var, path, zindex):
     """
     Collect ``var`` over the run (truncated to the last common step) and reduce
@@ -168,14 +175,14 @@ def collect_var(var, path, zindex):
     # Evolving fields accept tind; a static field has no time dim and would
     # reject it, so fall back to a plain read in that case.
     try:
-        data = np.asarray(collect(var, path=path, info=False, strict=True,
+        data = np.asarray(_collect(var, path, info=False, strict=True,
                                   **({"tind": tind} if tind is not None else {})))
     except Exception:
-        data = np.asarray(collect(var, path=path, info=False, strict=True))
+        data = np.asarray(_collect(var, path, info=False, strict=True))
 
     # Physical time axis (also truncated to the common range, if it exists).
     try:
-        t_array = np.asarray(collect("t_array", path=path, info=False, strict=True))
+        t_array = np.asarray(_collect("t_array", path, info=False, strict=True))
         if min_t is not None:
             t_array = t_array[:min_t]
     except Exception:

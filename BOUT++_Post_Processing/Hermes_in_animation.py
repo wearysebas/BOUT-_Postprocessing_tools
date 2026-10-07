@@ -36,6 +36,7 @@ Example
 
 import argparse
 import numpy as np
+import os
 import xbout
 import matplotlib
 import matplotlib.pyplot as plt
@@ -250,8 +251,9 @@ def main():
     # and we don't need them: all geometry comes from rm/zm above. We only need
     # the variable values indexed by BOUT (ix, iy).
     print("Opening simulation dataset...")
+    squash = os.path.join(args.sim_results, "BOUT.squash.nc")
     sim = xbout.open_boutdataset(
-        args.sim_results + "/BOUT.dmp.*.nc",
+        squash if os.path.exists(squash) else args.sim_results + "/BOUT.dmp.*.nc",
         keep_yboundaries=False,
     )
 

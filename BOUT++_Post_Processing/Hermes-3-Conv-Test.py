@@ -67,7 +67,11 @@ def open_aligned_boutdataset(datapath, **kwargs):
     """
     # Accept a directory, a glob pattern, or a path to a single representative file.
     if os.path.isdir(datapath):
-        pattern = os.path.join(datapath, "BOUT.dmp.*.nc")
+        squash = os.path.join(datapath, "BOUT.squash.nc")
+        if os.path.exists(squash):
+            return xbout.open_boutdataset(datapath=squash, **kwargs)
+        else:
+            pattern = os.path.join(datapath, "BOUT.dmp.*.nc")
     else:
         pattern = datapath
 
@@ -101,6 +105,18 @@ def open_aligned_boutdataset(datapath, **kwargs):
         )
 
     datasets = [ds.isel(t=slice(0, min_t)) for ds in datasets]
+
+    t_ref = datasets[0]["t_array"].values
+    good = np.ones(min_t, dtype=bool)
+    for ds in datasets[1:]:
+        good &= ds["t_array"].values == t_ref
+    n_good = int(np.argmin(good)) if not good.all() else min_t
+    if n_good < min_t:
+        print(
+            f"[Hermes-3-Conv-Test] t_array mismatch across ranks from t index "
+            f"{n_good}; truncating to 0..{n_good - 1}."
+        )
+        datasets = [ds.isel(t=slice(0, n_good)) for ds in datasets]
 
     return xbout.open_boutdataset(datapath=datasets, **kwargs)
 
