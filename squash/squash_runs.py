@@ -14,6 +14,7 @@ Usage (on Viking):
     python squash_runs.py                       # both default roots
     python squash_runs.py --step 50 --dry-run   # see what would happen
     python squash_runs.py --delete-dumps        # remove BOUT.dmp.* after a verified squash
+    python squash_runs.py --only SF45           # only runs inside a folder named SF45
 """
 
 import argparse
@@ -235,9 +236,13 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="only report what would be done")
     p.add_argument("--delete-dumps", action="store_true",
                    help="delete BOUT.dmp.*.nc after a verified squash (restart files are kept)")
+    p.add_argument("--only", nargs="+", metavar="NAME",
+                   help="only squash runs with a path component equal to one of these folder names")
     args = p.parse_args()
 
     runs = find_runs(args.roots)
+    if args.only:
+        runs = [r for r in runs if set(args.only) & set(r.split(os.sep))]
     if not runs:
         print("No runs found.")
         return 1

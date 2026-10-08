@@ -40,6 +40,7 @@ Target locations in the BOUT++ double-null poloidal layout (no y-guards frame):
 import sys
 import os
 import glob
+import re
 import argparse
 
 import numpy as np
@@ -66,11 +67,8 @@ except ImportError:
 QE = 1.602176634e-19   # elementary charge [C]
 MP = 1.672621898e-27   # proton mass [kg]
 
-GEOM_KEYS     = ["sf_plus",  "hfs_sfm",  "lfs_sfm",  "ideal_sf", "sn",         "sf45",      "sf135"]
-GEOM_LABELS   = ["SF+",      "HFS SF−",  "LFS SF−",  "Ideal SF", "SN",         "SF45",      "SF135"]
-GEOM_METAVARS = ["SF+",      "HFS_SF-",  "LFS_SF-",  "IdealSF",  "SN",         "SF45",      "SF135"]
-COLORS        = ["tab:blue", "tab:orange", "tab:cyan", "tab:red", "tab:purple", "tab:green", "tab:pink"]
-LINESTYLES    = ["-",        "-",       "-",       ":",        "-", "-", "-"]
+COLOR_CYCLE = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple",
+               "tab:brown", "tab:pink", "tab:olive", "tab:cyan", "tab:gray"]
 
 TARGET_LABELS = [
     "SP1 – NW target",
@@ -110,6 +108,27 @@ def _common_nt(sim_path):
     return min(tlens), max(tlens), len(files)
 
 
+def _first_unwritten_t(sim_path, min_t,
+                       varnames=("efe_tot_ylow", "efd+_tot_ylow", "efi_tot_ylow",
+                                 "Pe", "Te", "Ne", "Td+", "Nd+")):
+    """
+    First output step (< min_t) where any of ``varnames`` still holds the netCDF
+    fill value (~9.97e36), i.e. a step that was never fully written. Returns
+    ``min_t`` if every step is clean.
+    """
+    for f in sorted(glob.glob(_dump_pattern(sim_path))):
+        with netCDF4.Dataset(f) as d:
+            d.set_auto_mask(False)
+            for v in varnames:
+                if v not in d.variables or "t" not in d[v].dimensions:
+                    continue
+                a = np.abs(d[v][:min_t]).reshape(min_t, -1)
+                bad = np.flatnonzero((a > 9.0e36).any(axis=1))
+                if bad.size:
+                    min_t = int(bad[0])
+    return min_t
+
+
 def _tavg(da, t0, t1, poloidal_dim="theta"):
     """Time-average a DataArray over steps [t0, t1] (inclusive), collapsing the
     time and toroidal dims so the result is (x, poloidal).
@@ -121,6 +140,82 @@ def _tavg(da, t0, t1, poloidal_dim="theta"):
     keep = {"x", poloidal_dim}
     reduce_dims = [d for d in sl.dims if d not in keep]   # t + toroidal (zeta/z)
     return sl.mean(reduce_dims).values
+
+
+# ── Case discovery ─────────────────────────────────────────────────────────────
+# Sim folders are named SF<angle>[suffix] or SN[suffix]. The grid for SF<angle> is
+# the file in the grid folder whose name contains "sf<angle>" not followed by
+# another digit (sf75 -> mastu_sf75p_bout.grd.nc); SN takes the "lsn"/"sn" grid.
+
+_CASE_RE = re.compile(r"^(?:SF(\d+)|SN)(.*)$", re.IGNORECASE)
+
+
+def _find_grid(grid_dir, angle):
+    if angle is None:
+        pat = re.compile(r"(?:^|_)l?sn(?:_|\.)", re.IGNORECASE)
+    else:
+        pat = re.compile(rf"sf{angle}(?!\d)", re.IGNORECASE)
+    hits = sorted(f for f in glob.glob(os.path.join(grid_dir, "*.nc"))
+                  if pat.search(os.path.basename(f)))
+    if len(hits) > 1:
+        raise ValueError(f"several grids match: {[os.path.basename(h) for h in hits]}")
+    return hits[0] if hits else None
+
+
+def _nx(path):
+    with netCDF4.Dataset(path) as d:
+        return int(d["nx"][...])
+
+
+def discover_cases(sims_dir, grid_dir, only=None):
+    """
+    Pair every SF<angle>/SN sim folder in ``sims_dir`` with its grid in ``grid_dir``.
+
+    Returns a list of dicts (label, path, grid, color, ls) sorted by angle, SN last.
+    Variants of one angle (e.g. SF45-New_Limiter) share its colour, dashed.
+    """
+    only = {o.upper() for o in only} if only else None
+    cases = []
+    for name in sorted(os.listdir(sims_dir)):
+        path = os.path.join(sims_dir, name)
+        m = _CASE_RE.match(name)
+        if not os.path.isdir(path) or m is None:
+            continue
+        if only is not None and name.upper() not in only:
+            continue
+        dumps = sorted(glob.glob(_dump_pattern(path)))
+        if not dumps:
+            print(f"Skipping {name}: no BOUT.dmp / BOUT.squash files.")
+            continue
+        angle = int(m.group(1)) if m.group(1) else None
+        try:
+            grid = _find_grid(grid_dir, angle)
+        except ValueError as e:
+            print(f"Skipping {name}: {e}")
+            continue
+        if grid is None:
+            print(f"Skipping {name}: no matching grid in {grid_dir!r}.")
+            continue
+        nx_grid, nx_sim = _nx(grid), _nx(dumps[0])
+        if nx_grid != nx_sim:
+            print(f"Skipping {name}: grid {os.path.basename(grid)} has nx={nx_grid}, "
+                  f"sim has nx={nx_sim}.")
+            continue
+        cases.append({"label": name, "path": path, "grid": grid,
+                      "angle": angle, "variant": bool(m.group(2))})
+    if only is not None:
+        missing = only - {c["label"].upper() for c in cases}
+        if missing:
+            print(f"--only: not loaded: {sorted(missing)}")
+    cases.sort(key=lambda c: (c["angle"] is None, c["angle"] or 0, c["label"]))
+    bases = list(dict.fromkeys(c["angle"] for c in cases))
+    for c in cases:
+        c["color"] = COLOR_CYCLE[bases.index(c["angle"]) % len(COLOR_CYCLE)]
+        c["ls"] = "--" if c["variant"] else "-"
+    print("Cases:")
+    for c in cases:
+        print(f"  {c['label']:<20s} <- {os.path.basename(c['grid'])}")
+    return cases
 
 
 # ── Grid handling ──────────────────────────────────────────────────────────────
@@ -197,6 +292,13 @@ def load_simulation(sim_path, grid_file, t_window=20):
     if min_t != max_t:
         print(f"    Time-step mismatch across {nfiles} dump files "
               f"(t lengths {min_t}..{max_t}); clipping to t index {min_t - 1}.")
+    clean_t = _first_unwritten_t(sim_path, min_t)
+    if clean_t != min_t:
+        print(f"    Unwritten (netCDF fill) data from t index {clean_t}; "
+              f"clipping to t index {clean_t - 1}.")
+        min_t = clean_t
+    if min_t == 0:
+        raise ValueError(f"{sim_path}: no fully written time steps; cannot average.")
 
     # Clean toroidal geometry from the grid's psixy/Rxy. keep_yboundaries=False
     # (default) so the poloidal frame matches the grid (no y-guards). The corner
@@ -429,39 +531,17 @@ def plot_heat_flux(datasets, labels, colors, lstyles, q_key, ylabel, title, out_
 
 # ── Grid plotting (independent feature — still works) ────────────────────────────
 
-GRID_PLOT_ORDER = [
-    ("hfs_sfm",  "HFS-SF"),
-    ("sf45",     "SF45"),
-    ("sf_plus",  "SF75"),
-    ("ideal_sf", "Ideal-SF"),
-    ("sf135",    "SF135"),
-    ("lfs_sfm",  "LFS-SF"),
-    ("sn",       "LSN"),
-]
-
-
-def _resolve_grid_for_plot(args, key):
-    grid = getattr(args, f"grid_{key}")
-    if grid is None and getattr(args, key) is not None:
-        grid = args.grid
-    return grid
-
-
-def plot_grids(args, out_path):
+def plot_grids(cases, out_path):
     """Plot each provided SF grid side by side (grids only, no separatrices)."""
     if vig is None:
         print(f"--plot_grids: could not import visualize_in_grid from {_VIG_DIR!r}; "
               "skipping grid plot.")
         return
-    panels = []
-    for key, title in GRID_PLOT_ORDER:
-        grid = _resolve_grid_for_plot(args, key)
-        if grid is None:
-            continue
-        if not os.path.isfile(grid):
-            print(f"--plot_grids: grid file '{grid}' for {title} not found – skipping.")
-            continue
-        panels.append((grid, title))
+    panels, seen = [], set()
+    for c in cases:
+        if c["grid"] not in seen:
+            seen.add(c["grid"])
+            panels.append((c["grid"], c["label"]))
     if not panels:
         print("--plot_grids: no grids available to plot.")
         return
@@ -591,13 +671,12 @@ def main():
                     "from energy-flow diagnostics (A, default) or the analytic "
                     "sheath formula (C, --analytic_power)."
     )
-    parser.add_argument("--grid", default=None, metavar="GRID_FILE",
-                        help="Fallback BOUT++ grid (.nc) for geometries without a --grid-<name>")
-    for key, label, metavar in zip(GEOM_KEYS, GEOM_LABELS, GEOM_METAVARS):
-        parser.add_argument(key, nargs="?", default=None, metavar=metavar,
-                            help=f"{label} simulation path")
-        parser.add_argument(f"--grid-{key}", dest=f"grid_{key}", default=None,
-                            metavar="GRID_FILE", help=f"Grid file for {label}")
+    parser.add_argument("sims_dir",
+                        help="Folder containing the SF<angle>/SN simulation folders")
+    parser.add_argument("grid_dir",
+                        help="Folder containing the grid files (*sf<angle>*.nc, *lsn*.nc)")
+    parser.add_argument("--only", nargs="+", default=None, metavar="CASE",
+                        help="Only load these sim folders, e.g. --only SF15 SF45 SN")
     parser.add_argument("--twindow", type=int, default=20,
                         help="Number of final timesteps to time-average (default: 20)")
     parser.add_argument("--analytic_power", action="store_true", default=False,
@@ -614,50 +693,39 @@ def main():
     parser.add_argument("--ylim_norm", type=float, nargs=2, default=None, metavar=("YMIN", "YMAX"),
                         help="y-axis limits for the normalised heat-flux plot")
     parser.add_argument("--plot_grids", action="store_true", default=False,
-                        help="Plot each supplied grid side by side (grids only).")
+                        help="Plot each case's grid side by side (grids only).")
     parser.add_argument("--flux_profiles", action="store_true", default=False,
                         help="Also produce the equilibrium 3-panel figure: safety "
                              "factor q(rho_N), magnetic shear s(rho_N), and LFS "
                              "connection length L_par/rho_s0 (Giacomin Fig. 3 style).")
     args = parser.parse_args()
 
-    if args.grid is not None and not os.path.isfile(args.grid):
-        print(f"Error: fallback grid file '{args.grid}' not found.")
-        sys.exit(1)
+    for d in (args.sims_dir, args.grid_dir):
+        if not os.path.isdir(d):
+            print(f"Error: '{d}' is not a directory.")
+            sys.exit(1)
+    cases = discover_cases(args.sims_dir, args.grid_dir, only=args.only)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     if args.plot_grids:
-        plot_grids(args, os.path.join(script_dir, "SF_grids"))
+        plot_grids(cases, os.path.join(script_dir, "SF_grids"))
 
     datasets, labels, colors, lstyles = [], [], [], []
-    for key, label, color, ls in zip(GEOM_KEYS, GEOM_LABELS, COLORS, LINESTYLES):
-        path = getattr(args, key)
-        if path is None:
-            continue
-        if not os.path.isdir(path):
-            print(f"Warning: '{path}' is not a directory – skipping {label}.")
-            continue
-        grid = getattr(args, f"grid_{key}") or args.grid
-        if grid is None:
-            print(f"Warning: no grid for {label} (use --grid-{key} or --grid) – skipping.")
-            continue
-        if not os.path.isfile(grid):
-            print(f"Warning: grid file '{grid}' for {label} not found – skipping.")
-            continue
-        data = load_simulation(path, grid, t_window=args.twindow)
+    for c in cases:
+        data = load_simulation(c["path"], c["grid"], t_window=args.twindow)
         compute_target_power(data, analytic=args.analytic_power,
                              gamma_e=args.gamma_e, gamma_i=args.gamma_i)
         datasets.append(data)
-        labels.append(label)
-        colors.append(color)
-        lstyles.append(ls)
+        labels.append(c["label"])
+        colors.append(c["color"])
+        lstyles.append(c["ls"])
 
     if not datasets:
         if args.plot_grids:
             plt.show()
             return
-        print("No valid simulation paths provided.")
+        print("No simulations found.")
         sys.exit(1)
 
     print_si_sanity(datasets, labels)
@@ -711,19 +779,13 @@ def main():
     # ── Optional Figure 4: equilibrium flux-surface profiles (Giacomin Fig. 3) ─
     if args.flux_profiles:
         profiles, fp_labels, fp_colors, fp_lstyles = [], [], [], []
-        for key, label, color, ls in zip(GEOM_KEYS, GEOM_LABELS, COLORS, LINESTYLES):
-            path = getattr(args, key)
-            if path is None or not os.path.isdir(path):
-                continue
-            grid = getattr(args, f"grid_{key}") or args.grid
-            if grid is None or not os.path.isfile(grid):
-                continue
+        for c in cases:
             try:
-                rho_s0 = _read_rho_s0(path)
-                profiles.append(compute_flux_surface_profiles(grid, rho_s0))
-                fp_labels.append(label); fp_colors.append(color); fp_lstyles.append(ls)
+                rho_s0 = _read_rho_s0(c["path"])
+                profiles.append(compute_flux_surface_profiles(c["grid"], rho_s0))
+                fp_labels.append(c["label"]); fp_colors.append(c["color"]); fp_lstyles.append(c["ls"])
             except Exception as e:
-                print(f"--flux_profiles: could not build profiles for {label}: {e}")
+                print(f"--flux_profiles: could not build profiles for {c['label']}: {e}")
         if profiles:
             plot_flux_surface_figure(profiles, fp_labels, fp_colors, fp_lstyles,
                                      os.path.join(script_dir, "SF_flux_surface_profiles"))
