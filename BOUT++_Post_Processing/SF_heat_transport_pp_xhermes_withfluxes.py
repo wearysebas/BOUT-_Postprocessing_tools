@@ -33,7 +33,7 @@ power-fraction table/bar chart, and the --plot_grids mesh render (corner recipe)
 Target locations in the BOUT++ double-null poloidal layout (no y-guards frame):
     NW (SP1) : theta = 0
     NE (SP2) : theta = ny_inner - 1
-    SE (SP3) : theta = ny_inner + 1
+    SE (SP3) : theta = ny_inner
     SW (SP4) : theta = ny - 1
 """
 
@@ -66,6 +66,7 @@ except ImportError:
 # Physical constants (match Hermes-3 / BOUT++ SI:: values)
 QE = 1.602176634e-19   # elementary charge [C]
 MP = 1.672621898e-27   # proton mass [kg]
+ME = 9.1093837015e-31  # electron mass [kg]
 
 COLOR_CYCLE = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple",
                "tab:brown", "tab:pink", "tab:olive", "tab:cyan", "tab:gray"]
@@ -253,7 +254,8 @@ def _open_clean_grid(grid_file):
 
 # ── Loading: returns SI building blocks ─────────────────────────────────────────
 
-def load_simulation(sim_path, grid_file, t_window=20):
+def load_simulation(sim_path, grid_file, t_window=20, ben_example=False,
+                    ben_strict=False, gamma_e=None, gamma_i=None):
     """
     Load one Hermes-3 simulation via xHermes and return SI building blocks.
 
@@ -266,7 +268,8 @@ def load_simulation(sim_path, grid_file, t_window=20):
     dict with keys:
         d_sep      : (nx,) distance from primary separatrix at LFS midplane [rho_s0]
         q_0        : reference heat flux n0*Te0*cs0 at separatrix midplane [W/m^2]
-        target_y   : list of 4 poloidal indices [NW, NE, SE, SW] (no-guard frame)
+        target_y   : list of 4 poloidal indices [NW, NE, SE, SW] (no-guard frame);
+                     NE, SE are None in a single null (their slices are zeros)
         topology   : xbout topology string (e.g. upper-disconnected-double-null)
         # per-target lists (each a (nx,) array over the radial index):
         efe_power  : electron POWER through each target face   [W]   (efe_tot_ylow)
@@ -282,6 +285,8 @@ def load_simulation(sim_path, grid_file, t_window=20):
         ion_AA, ion_Z : ion mass number and charge (for the analytic sheath, C)
         has_sheath_pp : whether sheath-power diagnostics are present (approach B)
         ixseps1, MXG  : topology indices
+        balance       : compute_balance dict at the last clean step if
+                        ben_example (approach D), else None
     """
     print(f"  Loading {sim_path} ...")
 
@@ -370,11 +375,21 @@ def load_simulation(sim_path, grid_file, t_window=20):
     cs0     = np.sqrt(Te0_J / MP)             # [m/s]
     q_0     = n0 * Te0_J * cs0                # [W/m^2]
 
+    # ── Approach D: balance at the last clean step only (CLAUDE_BEN_FLUXES.md §4) ─
+    balance = None
+    if ben_example:
+        print(f"    Approach D: last clean step, t index {min_t - 1}.")
+        balance = compute_balance(ds.isel(t=-1), ydim, meta, opts, ion_name,
+                                  ion_AA, ion_Z, gamma_e=gamma_e, gamma_i=gamma_i,
+                                  ben_strict=ben_strict)
+
     # ── Slice the building blocks at each target poloidal index ──────────────
-    target_y = [0, ny_inner - 1, ny_inner + 1, ny - 1]
+    target_y = [0, ny_inner - 1, ny_inner, ny - 1]
+    if int(meta["jyseps2_1"]) == int(meta["jyseps1_2"]):
+        target_y = [0, None, None, ny - 1]
 
     def col(arr2d, yi):
-        return arr2d[:, yi]
+        return np.zeros(arr2d.shape[0]) if yi is None else arr2d[:, yi]
 
     return dict(
         d_sep=d_sep, q_0=q_0, target_y=target_y,
@@ -392,6 +407,7 @@ def load_simulation(sim_path, grid_file, t_window=20):
         ion_AA=ion_AA, ion_Z=ion_Z,
         has_sheath_pp=has_sheath_pp,
         ixseps1=ixseps1, MXG=MXG,
+        balance=balance,
     )
 
 
@@ -421,7 +437,7 @@ def print_si_sanity(datasets, labels):
 
 # ── Target power: approach A (default) or C (--analytic_power) ──────────────────
 
-def compute_target_power(data, analytic=False, gamma_e=3.5, gamma_i=3.5):
+def compute_target_power(data, analytic=False, gamma_e=3.5, gamma_i=3.5, ben=False):
     """
     Turn the SI building blocks into a parallel heat-flux profile and an
     integrated power at each target, by one of two routes (see physics.md §7).
@@ -442,13 +458,19 @@ def compute_target_power(data, analytic=False, gamma_e=3.5, gamma_i=3.5):
         sheath_boundary_simple defaults to 3.5 for both). The 5/3-polytropic and
         enthalpy refinements of the full sheath BC are not included here.
 
-    Both routes write the same downstream keys into `data`:
+    ben=True        →  APPROACH D (Ben_example_fluxes, CLAUDE_BEN_FLUXES.md)
+        Sheath power per cell from compute_balance (last clean step), taken
+        from data["balance"]; the analytic/gamma arguments are ignored.
+            q[W/m^2]    = (power_e + power_i) / area
+            P_target[W] = sum_x (power_e + power_i)
+
+    All routes write the same downstream keys into `data`:
         q        : list of 4 (nx,) arrays, parallel heat flux  [MW/m^2]
         q_norm   : list of 4 (nx,) arrays, q / q_0             [dimensionless]
         P_targets: list of 4 floats, integrated power per target [MW]
         P_total  : total power across the 4 targets             [MW]
         fractions: list of 4 floats, power fraction per target  [%]
-        approach : "A (energy-flow)" or "C (analytic sheath)"
+        approach : "A (energy-flow)", "C (analytic sheath)" or "D (Ben_example_fluxes)"
     """
     g = data["MXG"]
     sl = slice(g, -g if g else None)          # interior radial cells
@@ -457,7 +479,11 @@ def compute_target_power(data, analytic=False, gamma_e=3.5, gamma_i=3.5):
     q_list, P_list = [], []
     for i in range(4):
         area = data["area"][i]
-        if analytic:
+        if ben:
+            area = data["balance"]["slot_area"][i]
+            q = np.divide(data["balance"]["slot_power"][i], area,
+                          out=np.zeros_like(area), where=area > 0)       # [W/m^2]
+        elif analytic:
             mi  = data["ion_AA"] * MP
             Zi  = data["ion_Z"]
             TeJ = data["Te"][i] * QE
@@ -467,7 +493,8 @@ def compute_target_power(data, analytic=False, gamma_e=3.5, gamma_i=3.5):
                 + gamma_i * data["Ni"][i] * TiJ * Cs                   # [W/m^2]
         else:
             power_cell = np.abs(data["efe_power"][i]) + np.abs(data["ion_power"][i])
-            q = power_cell / area                                     # [W/m^2]
+            q = np.divide(power_cell, area,
+                          out=np.zeros_like(area), where=area > 0)    # [W/m^2]
         q_list.append(q)
         P_list.append(float(np.sum((q * area)[sl])))                  # [W]
 
@@ -477,7 +504,11 @@ def compute_target_power(data, analytic=False, gamma_e=3.5, gamma_i=3.5):
     data["P_targets"] = [P / 1e6 for P in P_list]                     # MW
     data["P_total"]  = P_total / 1e6                                  # MW
     data["fractions"] = [100.0 * P / P_total if P_total else 0.0 for P in P_list]
-    data["approach"] = "C (analytic sheath)" if analytic else "A (energy-flow)"
+    if ben:
+        data["approach"] = ("D (Ben_example_fluxes, ben_strict)"
+                            if data["balance"]["strict"] else "D (Ben_example_fluxes)")
+    else:
+        data["approach"] = "C (analytic sheath)" if analytic else "A (energy-flow)"
     return data
 
 
@@ -496,6 +527,338 @@ def print_power_table(datasets, labels):
     print("=" * width)
     print(f"\n{'Total power [MW]':<16}" + "".join(f"{d['P_total']:>{col}.3e}" for d in datasets))
     print(f"{'q_0 [MW/m^2]':<16}"      + "".join(f"{d['q_0']/1e6:>{col}.3e}"   for d in datasets))
+
+
+def print_balance_table(datasets, labels):
+    """Approach D power and particle balance (CLAUDE_BEN_FLUXES.md), one column per case."""
+    col = 13
+    width = 28 + col * len(labels)
+    bals = [d["balance"] for d in datasets]
+    slots = [[0, 1, 2, 3] if len(b["targets"]) == 4 else [0, None, None, 1] for b in bals]
+
+    def row(name, values, fmt=".4g"):
+        print(f"{name:<28}" + "".join(f"{v:>{col}{fmt}}" for v in values))
+
+    def per_target(key, ti, scale):
+        return [b[key][s[ti]] * scale if s[ti] is not None else np.nan
+                for b, s in zip(bals, slots)]
+
+    def parts(key):
+        return list(dict.fromkeys(n for b in bals for n in b[key]))
+
+    print("\n" + "=" * width)
+    print(f"Power balance [kW], last clean step   —   approach {datasets[0]['approach']}")
+    print("=" * width)
+    print(f"{'Term':<28}" + "".join(f"{l:>{col}}" for l in labels))
+    print("-" * width)
+    row("gamma_e", [b["gamma_e"] for b in bals])
+    row("gamma_i", [b["gamma_i"] for b in bals])
+    row("P_core (sources)", [b["P_core"] / 1e3 for b in bals])
+    row("P_x in, core", [b["P_x_in_core"] / 1e3 for b in bals])
+    row("P_x in, PF", [b["P_x_in_pf"] / 1e3 for b in bals])
+    row("P_x out", [b["P_x_out"] / 1e3 for b in bals])
+    for ti, short in enumerate(TARGET_SHORT):
+        row(f"Sheath {short} e", per_target("P_sheath_e", ti, 1e-3))
+        row(f"Sheath {short} i", per_target("P_sheath_i", ti, 1e-3))
+    row("P_rad", [b["P_rad"] / 1e3 for b in bals])
+    for n in parts("P_rad_parts"):
+        row(f"  {n}", [b["P_rad_parts"].get(n, np.nan) / 1e3 for b in bals])
+    row("P_neutral", [b["P_neutral"] / 1e3 for b in bals])
+    for n in parts("P_neutral_parts"):
+        row(f"  {n}", [b["P_neutral_parts"].get(n, np.nan) / 1e3 for b in bals])
+    print("-" * width)
+    row("P_net", [b["P_net"] / 1e3 for b in bals])
+    row("dE/dt internal", [b["dEdt_int"] / 1e3 for b in bals])
+    row("dE/dt kinetic", [b["dEdt_kin"] / 1e3 for b in bals])
+    row("Residual P_net - dE/dt", [b["residual"] / 1e3 for b in bals])
+    row("Residual [% of P_core]",
+        [100.0 * b["residual"] / b["P_core"] if b["P_core"] else np.nan for b in bals], ".3f")
+    print("=" * width)
+
+    print(f"\n{'Particle balance [s^-1]':<28}" + "".join(f"{l:>{col}}" for l in labels))
+    print("-" * width)
+    row("Gamma_x in, core", [b["G_x_in_core"] for b in bals], ".3e")
+    row("Gamma_x in, PF", [b["G_x_in_pf"] for b in bals], ".3e")
+    row("Gamma_x out", [b["G_x_out"] for b in bals], ".3e")
+    for ti, short in enumerate(TARGET_SHORT):
+        row(f"Sheath {short}", per_target("G_sheath", ti, 1.0), ".3e")
+    row("Ionisation", [b["G_iz"] for b in bals], ".3e")
+    row("Recombination", [b["G_rec"] for b in bals], ".3e")
+    row("Recycling fraction (Ben)", [b["f_recycle_ben"] for b in bals], ".4f")
+    row("Recycling fraction (direct)", [b["f_recycle_direct"] for b in bals], ".4f")
+    print("=" * width)
+
+
+# ── Approach D (Ben_example_fluxes): radial flows, sheath, regions ────────────
+
+def div_a_grad_perp_flows(J, g11, dx, dy, dz, a, f, ben_strict=False):
+    """
+    Radial flow through every x cell face, Div_a_Grad_perp_upwind from
+    analyse_fluxes.py (CLAUDE_BEN_FLUXES.md §3 items 1-2).
+
+    All inputs are (nx, ny) SI arrays including the x guard cells. Returns
+    (F_L, F_R): flow into each cell from x-1 and out of it to x+1, already
+    integrated over the face ([W] for heat, [s^-1] for particles). Hermes
+    upwinds the face coefficient (div_ops.cxx:1496); ben_strict averages it.
+    """
+    gradient = ((J[:-1] * g11[:-1] + J[1:] * g11[1:])
+                * (f[1:] - f[:-1]) / (dx[:-1] + dx[1:]))
+    if ben_strict:
+        a_face = 0.5 * (a[:-1] + a[1:])
+    else:
+        a_face = np.where(gradient > 0, a[1:], a[:-1])
+    flux = -gradient * a_face * dy[:-1] * dz[:-1]
+
+    F_L = np.zeros_like(f)
+    F_R = np.zeros_like(f)
+    F_R[:-1] = flux
+    F_L[1:] = flux
+    return F_L, F_R
+
+
+def _limit_free(fm, fc, mode):
+    """Hermes limitFree (sheath_boundary_simple.cxx:29): guard value from the
+    boundary cell fc and its inner neighbour fm. Mode 0: exponential, Neumann
+    if that would increase; 1: exponential; 2: linear."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fp = 2.0 * fc - fm if mode == 2 else fc**2 / fm
+    fp = np.where(fm > 0, fp, fc)
+    if mode == 0:
+        fp = np.where(fm < fc, fc, fp)
+    return fp
+
+
+def sheath_target_flows(Ne, Ni, Te, Ti, Vi, area, y, side, gamma_e, gamma_i,
+                        AA=2.0, Zi=1.0, sheath_ion_polytropic=1.0,
+                        density_mode=1, temperature_mode=1, ben_strict=False):
+    """
+    Sheath power and particle flow through one target face, for the boundary
+    cell row ``y`` on ``side`` ("lower" or "upper").
+
+    Ne, Ni [m^-3], Te, Ti [eV], Vi [m/s] are (nx, ny) SI arrays (no y guards);
+    ``area`` is the (nx,) y-face area J*dx*dz/sqrt(g_22) [m^2].
+    Returns (power_e, power_i, particles), each (nx,), positive out of the
+    domain, in [W], [W], [s^-1].
+
+    Hermes (default, CLAUDE_BEN_FLUXES.md §3 items 3-5): limitFree guards, ion
+    speed max(Vi into the target, Cs), q = gamma*T*n*v for both species,
+    electron flux = Zi * ion flux (zero current, phi not evolved).
+    ben_strict: analyse_fluxes.py exactly — exponential guards, v = Cs,
+    q_e = ((gamma_e - 2.5)*T - me*v^2/2)*n*v at lower targets and
+    (gamma_e*T - me*v^2/2)*n*v at upper targets.
+    """
+    yn = y + 1 if side == "lower" else y - 1
+    ne_c, ni_c, te_c, ti_c = Ne[:, y], Ni[:, y], Te[:, y], Ti[:, y]
+
+    if ben_strict:
+        ne_g = ne_c**2 / Ne[:, yn]
+        te_g = te_c**2 / Te[:, yn]
+        ti_g = ti_c**2 / Ti[:, yn]
+    else:
+        ne_g = _limit_free(Ne[:, yn], ne_c, density_mode)
+        ni_g = _limit_free(Ni[:, yn], ni_c, density_mode)
+        te_g = _limit_free(Te[:, yn], te_c, temperature_mode)
+        ti_g = _limit_free(Ti[:, yn], ti_c, temperature_mode)
+
+    nesheath = 0.5 * (ne_c + ne_g)
+    tesheath = 0.5 * (te_c + te_g)
+    tisheath = 0.5 * (ti_c + ti_g)
+    Cs = np.sqrt((sheath_ion_polytropic * QE * tisheath + Zi * QE * tesheath)
+                 / (AA * MP))
+
+    if ben_strict:
+        v = Cs
+        e_coef = gamma_e - 2.5 if side == "lower" else gamma_e
+        q_e = (e_coef * QE * tesheath - 0.5 * ME * v**2) * nesheath * v
+        q_i = gamma_i * QE * tisheath * nesheath * v
+        particles = nesheath * v * area
+    else:
+        nisheath = 0.5 * (ni_c + ni_g)
+        v_in = -Vi[:, y] if side == "lower" else Vi[:, y]
+        ion_flux = nisheath * np.maximum(v_in, Cs)
+        q_e = gamma_e * QE * tesheath * Zi * ion_flux
+        q_i = gamma_i * QE * tisheath * ion_flux
+        particles = ion_flux * area
+
+    return q_e * area, q_i * area, particles
+
+
+def sheath_targets(ny_inner, ny, single_null=False):
+    """(y, side) of each target face, no-y-guard frame (CLAUDE_BEN_FLUXES.md §2.1)."""
+    if single_null:
+        return [(0, "lower"), (ny - 1, "upper")]
+    return [(0, "lower"), (ny_inner - 1, "upper"), (ny_inner, "lower"), (ny - 1, "upper")]
+
+
+def core_y_mask(snowflake_type, ny, jyseps1_1, jyseps2_1, jyseps1_2, jyseps2_2):
+    """Poloidal cells whose inner x-boundary is core (CLAUDE_BEN_FLUXES.md §2.2);
+    the rest of the inner x-boundary is private flux."""
+    y = np.arange(ny)
+    inner = (y > jyseps1_1) & (y <= jyseps2_1)
+    middle = (y > jyseps2_1) & (y <= jyseps1_2)
+    outer = (y > jyseps1_2) & (y <= jyseps2_2)
+    if snowflake_type == "sf_plus_high_field_side":
+        return middle
+    if snowflake_type in ("sf_minus_low_field_side", "sf_minus_high_field_side"):
+        return inner | outer
+    return inner
+
+
+def _opt(opts, section, key, default):
+    try:
+        return float(opts[section][key])
+    except Exception:
+        return default
+
+
+def compute_balance(ds_t, ydim, meta, opts, ion_name="d+", ion_AA=2.0, ion_Z=1.0,
+                    gamma_e=None, gamma_i=None, ben_strict=False):
+    """
+    Approach D (Ben_example_fluxes): power and particle balance at one time
+    step — analyse_fluxes.py adapted to the SF topology (CLAUDE_BEN_FLUXES.md).
+
+    ``ds_t`` is the xHermes dataset at a single time (SI, x guards kept, no y
+    guards). gamma_e / gamma_i default to [sheath_boundary_simple] in
+    BOUT.settings (Hermes default 3.5). Powers in [W], particle flows in
+    [s^-1]. Inner x-boundary terms are positive into the domain; outer
+    x-boundary and sheath terms are positive out of it.
+
+    The per-target sheath arrays are also returned in the 4 target slots
+    [NW, NE, SE, SW] (``slot_power``, ``slot_area``) for compute_target_power;
+    a single null fills NW and SW and leaves NE, SE at zero.
+    """
+    def xy(name):
+        da = ds_t[name]
+        return da.mean([d for d in da.dims if d not in ("x", ydim)]).values
+
+    def has(name):
+        return name in ds_t
+
+    g = int(meta["MXG"])
+    xs = slice(g, -g if g else None)
+    xin, xout = g, ds_t.sizes["x"] - g - 1
+    ny, ny_inner = int(meta["ny"]), int(meta["ny_inner"])
+    j11, j21, j12, j22 = (int(meta[k]) for k in
+                          ("jyseps1_1", "jyseps2_1", "jyseps1_2", "jyseps2_2"))
+    single_null = j21 == j12
+
+    J, g11, g_22 = xy("J"), xy("g11"), xy("g_22")
+    dx, dy, dz = xy("dx"), xy("dy"), xy("dz")
+    dV = J * dx * dy * dz
+    area = J * dx * dz / np.sqrt(g_22)
+
+    def vol(f):
+        return float(np.sum((f * dV)[xs]))
+
+    neutral = "d"
+    try:
+        neutral = str(opts[ion_name]["recycle_as"]).strip()
+    except Exception:
+        pass
+
+    Ne, Te = xy("Ne"), xy("Te")
+    Ni = xy("N" + ion_name) if has("N" + ion_name) else Ne
+    Ti = xy("T" + ion_name) if has("T" + ion_name) else Te
+    Vi = xy("V" + ion_name) if has("V" + ion_name) else np.zeros_like(Ne)
+
+    def coef(kind, sp):
+        name = f"anomalous_{kind}_{sp}"
+        return xy(name) if has(name) else np.zeros_like(Ne)
+
+    # ── Radial (x) flows: anomalous chi and D, full x (CLAUDE_BEN_FLUXES.md §2.2-2.3)
+    d_factor = 1.0 if ben_strict else 1.5
+    F_heat_L, F_heat_R = np.zeros_like(Ne), np.zeros_like(Ne)
+    for sp, N, T in (("e", Ne, Te), (ion_name, Ni, Ti)):
+        for a, f in ((coef("Chi", sp) * N, QE * T),
+                     (d_factor * QE * coef("D", sp) * T, N)):
+            F_L, F_R = div_a_grad_perp_flows(J, g11, dx, dy, dz, a, f, ben_strict)
+            F_heat_L += F_L
+            F_heat_R += F_R
+    F_part_L, F_part_R = div_a_grad_perp_flows(J, g11, dx, dy, dz,
+                                               coef("D", ion_name), Ni, ben_strict)
+
+    core = core_y_mask(meta.get("snowflake_type", ""), ny, j11, j21, j12, j22)
+
+    # ── Core volumetric source (CLAUDE_BEN_FLUXES.md §2.4) ────────────────────
+    P_core = 1.5 * sum(vol(xy(f"P{sp}_src")) for sp in ("e", ion_name)
+                       if has(f"P{sp}_src"))
+
+    # ── Sheath at every target ────────────────────────────────────────────────
+    sec = "sheath_boundary_simple"
+    gamma_e = _opt(opts, sec, "gamma_e", 3.5) if gamma_e is None else gamma_e
+    gamma_i = _opt(opts, sec, "gamma_i", 3.5) if gamma_i is None else gamma_i
+    sheath_kw = dict(AA=ion_AA, Zi=ion_Z,
+                     sheath_ion_polytropic=_opt(opts, sec, "sheath_ion_polytropic", 1.0),
+                     density_mode=_opt(opts, sec, "density_boundary_mode", 1),
+                     temperature_mode=_opt(opts, sec, "temperature_boundary_mode", 1),
+                     ben_strict=ben_strict)
+    targets = sheath_targets(ny_inner, ny, single_null)
+    slots = [0, 3] if single_null else [0, 1, 2, 3]
+    slot_power = [np.zeros_like(Ne[:, 0]) for _ in range(4)]
+    slot_area = [np.zeros_like(Ne[:, 0]) for _ in range(4)]
+    P_sheath_e, P_sheath_i, G_sheath = [], [], []
+    for (y, side), s in zip(targets, slots):
+        pe, pi, pn = sheath_target_flows(Ne, Ni, Te, Ti, Vi, area[:, y], y, side,
+                                         gamma_e, gamma_i, **sheath_kw)
+        slot_power[s] = pe + pi
+        slot_area[s] = area[:, y]
+        P_sheath_e.append(float(pe[xs].sum()))
+        P_sheath_i.append(float(pi[xs].sum()))
+        G_sheath.append(float(pn[xs].sum()))
+
+    # ── Radiation (×1.5 and no impurity only under ben_strict, §3 item 6) ─────
+    rad_names = [f"R{ion_name}_ex", f"R{ion_name}_rec"] + ([] if ben_strict else ["Rc"])
+    rad_factor = 1.5 if ben_strict else 1.0
+    P_rad_parts = {n: -rad_factor * vol(xy(n)) for n in rad_names if has(n)}
+
+    # ── Neutral boundary energy sources (§3 item 9) ───────────────────────────
+    P_neutral_parts = {}
+    if not ben_strict:
+        for suffix in ("target_recycle", "wall_refl", "target_refl", "pump"):
+            n = f"E{neutral}_{suffix}"
+            if has(n):
+                P_neutral_parts[n] = vol(xy(n))
+
+    # ── Rate of change of stored energy (§3 item 7) ───────────────────────────
+    species = ("e", ion_name, neutral)
+    dEdt_int = 1.5 * sum(vol(xy(f"ddt(P{sp})")) for sp in species if has(f"ddt(P{sp})"))
+    dEdt_kin = 0.0
+    for sp in species:
+        if all(has(n) for n in (f"ddt(NV{sp})", f"ddt(N{sp})", f"NV{sp}", f"V{sp}", f"N{sp}")):
+            V = xy(f"V{sp}")
+            dEdt_kin += vol(V * xy(f"ddt(NV{sp})")
+                            - 0.5 * xy(f"NV{sp}") * V * xy(f"ddt(N{sp})") / xy(f"N{sp}"))
+
+    P_x_in_core = float(F_heat_L[xin, core].sum())
+    P_x_in_pf = float(F_heat_L[xin, ~core].sum())
+    P_x_out = float(F_heat_R[xout].sum())
+    P_rad = sum(P_rad_parts.values())
+    P_neutral = sum(P_neutral_parts.values())
+    P_net = (P_core + P_x_in_core + P_x_in_pf - P_x_out
+             - sum(P_sheath_e) - sum(P_sheath_i) - P_rad + P_neutral)
+
+    # ── Particle balance ──────────────────────────────────────────────────────
+    G_x_in_core = float(F_part_L[xin, core].sum())
+    G_x_in_pf = float(F_part_L[xin, ~core].sum())
+    G_x_out = float(F_part_R[xout].sum())
+    G_sum = sum(G_sheath)
+    recycle = f"S{neutral}_target_recycle"
+
+    return dict(
+        strict=ben_strict, gamma_e=gamma_e, gamma_i=gamma_i,
+        targets=targets, slot_power=slot_power, slot_area=slot_area,
+        P_core=P_core, P_x_in_core=P_x_in_core, P_x_in_pf=P_x_in_pf, P_x_out=P_x_out,
+        P_sheath_e=P_sheath_e, P_sheath_i=P_sheath_i,
+        P_rad=P_rad, P_rad_parts=P_rad_parts,
+        P_neutral=P_neutral, P_neutral_parts=P_neutral_parts,
+        P_net=P_net, dEdt_int=dEdt_int, dEdt_kin=dEdt_kin,
+        residual=P_net - dEdt_int - dEdt_kin,
+        G_x_in_core=G_x_in_core, G_x_in_pf=G_x_in_pf, G_x_out=G_x_out, G_sheath=G_sheath,
+        f_recycle_ben=1.0 - (G_x_in_core + G_x_in_pf - G_x_out) / G_sum if G_sum else np.nan,
+        f_recycle_direct=vol(xy(recycle)) / G_sum if (has(recycle) and G_sum) else np.nan,
+        G_iz=vol(xy(f"S{ion_name}_iz")) if has(f"S{ion_name}_iz") else np.nan,
+        G_rec=vol(xy(f"S{ion_name}_rec")) if has(f"S{ion_name}_rec") else np.nan,
+    )
 
 
 # ── Plotting helpers ────────────────────────────────────────────────────────────
@@ -668,8 +1031,9 @@ def plot_flux_surface_figure(profiles, labels, colors, lstyles, out_path):
 def main():
     parser = argparse.ArgumentParser(
         description="SI-clean (xHermes) SF target heat-flux analysis. Target power "
-                    "from energy-flow diagnostics (A, default) or the analytic "
-                    "sheath formula (C, --analytic_power)."
+                    "from energy-flow diagnostics (A, default), the analytic "
+                    "sheath formula (C, --analytic_power) or Ben's flux and "
+                    "balance calculation (D, --ben_example_fluxes)."
     )
     parser.add_argument("sims_dir",
                         help="Folder containing the SF<angle>/SN simulation folders")
@@ -682,10 +1046,19 @@ def main():
     parser.add_argument("--analytic_power", action="store_true", default=False,
                         help="Use the analytic sheath flux (approach C) instead of the "
                              "energy-flow diagnostics (approach A, default).")
-    parser.add_argument("--gamma_e", type=float, default=3.5,
-                        help="Electron sheath heat transmission coefficient for C (default: 3.5)")
-    parser.add_argument("--gamma_i", type=float, default=3.5,
-                        help="Ion sheath heat transmission coefficient for C (default: 3.5)")
+    parser.add_argument("--ben_example_fluxes", action="store_true", default=False,
+                        help="Approach D (Ben_example_fluxes): sheath power from "
+                             "analyse_fluxes.py adapted to SF, at the last clean step, "
+                             "plus the power/particle balance table (CLAUDE_BEN_FLUXES.md).")
+    parser.add_argument("--ben_strict", action="store_true", default=False,
+                        help="With --ben_example_fluxes: use Ben's formulas exactly instead "
+                             "of the Hermes-source ones (CLAUDE_BEN_FLUXES.md §3).")
+    parser.add_argument("--gamma_e", type=float, default=None,
+                        help="Electron sheath heat transmission coefficient. C: default 3.5; "
+                             "D: default from BOUT.settings [sheath_boundary_simple].")
+    parser.add_argument("--gamma_i", type=float, default=None,
+                        help="Ion sheath heat transmission coefficient. C: default 3.5; "
+                             "D: default from BOUT.settings [sheath_boundary_simple].")
     parser.add_argument("--xlim", type=float, nargs=2, default=None, metavar=("XMIN", "XMAX"),
                         help="x-axis limits in rho_s0 units, e.g. --xlim -5 20")
     parser.add_argument("--ylim", type=float, nargs=2, default=None, metavar=("YMIN", "YMAX"),
@@ -699,6 +1072,10 @@ def main():
                              "factor q(rho_N), magnetic shear s(rho_N), and LFS "
                              "connection length L_par/rho_s0 (Giacomin Fig. 3 style).")
     args = parser.parse_args()
+    if args.ben_example_fluxes and args.analytic_power:
+        parser.error("--ben_example_fluxes and --analytic_power cannot be combined.")
+    if args.ben_strict and not args.ben_example_fluxes:
+        parser.error("--ben_strict needs --ben_example_fluxes.")
 
     for d in (args.sims_dir, args.grid_dir):
         if not os.path.isdir(d):
@@ -707,15 +1084,22 @@ def main():
     cases = discover_cases(args.sims_dir, args.grid_dir, only=args.only)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    approach_tag = ("D_strict" if args.ben_strict else "D" if args.ben_example_fluxes
+                    else "C" if args.analytic_power else "A")
 
     if args.plot_grids:
         plot_grids(cases, os.path.join(script_dir, "SF_grids"))
 
     datasets, labels, colors, lstyles = [], [], [], []
     for c in cases:
-        data = load_simulation(c["path"], c["grid"], t_window=args.twindow)
+        data = load_simulation(c["path"], c["grid"], t_window=args.twindow,
+                               ben_example=args.ben_example_fluxes,
+                               ben_strict=args.ben_strict,
+                               gamma_e=args.gamma_e, gamma_i=args.gamma_i)
         compute_target_power(data, analytic=args.analytic_power,
-                             gamma_e=args.gamma_e, gamma_i=args.gamma_i)
+                             gamma_e=3.5 if args.gamma_e is None else args.gamma_e,
+                             gamma_i=3.5 if args.gamma_i is None else args.gamma_i,
+                             ben=args.ben_example_fluxes)
         datasets.append(data)
         labels.append(c["label"])
         colors.append(c["color"])
@@ -732,6 +1116,8 @@ def main():
     print(f"\nTopology (xbout): {datasets[0].get('topology')}    "
           f"Power approach: {datasets[0]['approach']}")
     print_power_table(datasets, labels)
+    if args.ben_example_fluxes:
+        print_balance_table(datasets, labels)
 
     # ── Figure 1: SI units [MW/m^2] ──────────────────────────────────────────
     plot_heat_flux(
@@ -739,7 +1125,7 @@ def main():
         q_key   = "q",
         ylabel  = r"$q_\parallel\;[\mathrm{MW\,m}^{-2}]$",
         title   = r"Total parallel heat flux ($q_e + q_i$) at divertor targets",
-        out_path= os.path.join(script_dir, "SF_heat_flux_targets"),
+        out_path= os.path.join(script_dir, f"SF_heat_flux_targets_{approach_tag}"),
         xlim    = args.xlim, ylim = args.ylim,
     )
 
@@ -749,7 +1135,7 @@ def main():
         q_key   = "q_norm",
         ylabel  = r"$q_\parallel\,/\,q_0$",
         title   = r"Normalised parallel heat flux ($q_e + q_i$) / $q_0$ at divertor targets",
-        out_path= os.path.join(script_dir, "SF_heat_flux_targets_normalised"),
+        out_path= os.path.join(script_dir, f"SF_heat_flux_targets_normalised_{approach_tag}"),
         xlim    = args.xlim, ylim = args.ylim_norm,
     )
 
@@ -771,7 +1157,7 @@ def main():
     ax3.legend(fontsize=9)
     ax3.grid(True, axis="y", alpha=0.25)
     plt.tight_layout()
-    out_frac = os.path.join(script_dir, "SF_power_fractions")
+    out_frac = os.path.join(script_dir, f"SF_power_fractions_{approach_tag}")
     plt.savefig(out_frac + ".pdf", bbox_inches="tight")
     plt.savefig(out_frac + ".png", dpi=150, bbox_inches="tight")
     print(f"Saved: {out_frac}.pdf / .png")
