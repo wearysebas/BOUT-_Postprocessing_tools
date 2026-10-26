@@ -1,0 +1,855 @@
+@@ current 8-14  ->  new 8-16 @@
+      8     Tier 0  Has phi converged?        phi at probe points vs t, max/rms dphi/dt,
+      9                                       target particle/power flows vs t, totals
+-    10     Tier 1  2D maps of scalars        phi, phi/Te, radial ExB particle flux,
++    10     Tier 1  2D maps                   phi, phi/Te, E_r, E_pol, v_E,r, v_E,pol,
++    11                                       radial ExB particle flux,
+     11                                       |Gamma_ExB| / |Gamma_anomalous|, j_par,
+-    12                                       DivJdia (if diagnosed), Ne, Te
++    13                                       div J_dia, Ne, Te  (separatrices and
++    14                                       branch cuts overlaid)
+     13             1D cuts of components     radial cuts (OMP + each leg entrance) and
+     14                                       poloidal cuts (first SOL ring + last ring
+@@ current 16-25  ->  new 18-49 @@
+     16                                       n v_E,r
+     17     Tier 2  1D profiles               OMP radial, per-target, along one ring
+-    18     Tier 3  Per-strike-point budget   power, particle flow, net current into
+-    19                                       each target (sum should be ~0)
+-    20     Tier 4  Drifts vs no drifts       (with --compare) Delta maps; Tiers 2/3
+-    21                                       overlay both runs automatically
++    20     Tier 3  Per-strike-point budget   power, particle flow, current budget:
++    21                                       j_par and J_dia into each target plus
++    22                                       J_dia through the radial boundaries
++    23                                       (sum should be ~0)
++    24             All-case summary          power and particle flow per strike point
++    25                                       for every case, both runs
++    26     Tier 4  Drifts vs no drifts       (with --compare) side-by-side Ne/Te,
++    27                                       Delta maps, Delta target profiles;
++    28                                       Tiers 2/3 overlay both runs automatically
+     22 
+-    23 Every figure is saved to ``--outdir`` (default ``<sim_results>/drifts_pp``).
++    30 Figures go to ``<outdir>/Drifts/<case>/`` or ``<outdir>/No_drifts/<case>/``
++    31 depending on ``--drifts``; the all-case summary to ``<outdir>/<Drifts|No_drifts>/``.
++    32 
++    33 --------------------------------------------------------------------------------
++    34 Reconstructed fields (not in the dumps)
++    35 --------------------------------------------------------------------------------
++    36 Anomalous radial particle flow, when ``pf<ion>_tot_xlow`` is absent: the x-face
++    37 flow of ``Div_a_Grad_perp_upwind_flows`` (src/div_ops.cxx), evaluated from the
++    38 dumped ``anomalous_D_<ion>`` and ``N<ion>``
++    39 
++    40     flow_{i+1/2} = -[(J g11)_i + (J g11)_{i+1}] (N_{i+1} - N_i) / (dx_i + dx_{i+1})
++    41                    * D_upwind * dy dz
++    42 
++    43 Diamagnetic current, as ``RelaxPotential::calculateDivJdia``: summed over the
++    44 charged species with a pressure,
++    45 
++    46     J_dia = sum_s P_s Curlb_B,   Curlb_B^{x,y} = 2 bxcv{x,y} / B   (SI)
++    47     div J_dia = ( d/dx(J J_dia^x) + d/dy(J J_dia^y) ) / J   (BOUT Div(Vector3D))
+     24 
+     25 --------------------------------------------------------------------------------
+@@ current 71-85  ->  new 95-117 @@
+     71 Usage
+     72 --------------------------------------------------------------------------------
+-    73     python hermes-drifts-0.py <grid_file> <sim_results_dir> [options]
++    97     python hermes-drifts-0.py <sims_dir> <grid_dir> [--only SF45 ...] [options]
+     74 
+-    75     # everything, files only
+-    76     python hermes-drifts-0.py mastu_sf135_bout.grd.nc runs/sf135-drifts
++    99     Every SF<angle>/SN folder in sims_dir is paired with its grid in grid_dir
++   100     (discover_cases from SF_heat_transport_pp_xhermes_withfluxes.py), exactly
++   101     as in hermes-heat-pp-method-comparison.py.
+     77 
+-    78     # drifts vs a matched no-drift run
+-    79     python hermes-drifts-0.py mastu_sf135_bout.grd.nc runs/sf135-drifts \\
+-    80         --compare runs/sf135-nodrifts
++   103     # every drift case, files only
++   104     python hermes-drifts-0.py CVODE_test grids/Hermes-3/sf-new-limiter
++   105 
++   106     # drifts vs the matched no-drift runs (cases matched by folder name)
++   107     python hermes-drifts-0.py CVODE_test grids/Hermes-3/sf-new-limiter \\
++   108         --only SF45 --compare No_Drifts
++   109 
++   110     # the no-drift runs on their own, into Post_Processing/No_drifts
++   111     python hermes-drifts-0.py No_Drifts grids/Hermes-3/sf-new-limiter --drifts False
+     81 
+     82     # only the convergence check, shown on screen
+-    83     python hermes-drifts-0.py grid.nc runs/sf135-drifts --tiers 0 --show
++   114     python hermes-drifts-0.py CVODE_test grids/Hermes-3/sf-new-limiter \\
++   115         --only SF45 --tiers 0 --show
+     84 """
+     85 
+@@ current 95-98  ->  new 127-131 @@
+     95 import xarray as xr
+     96 import matplotlib.pyplot as plt
++   129 from matplotlib.patches import Patch
+     97 
+     98 
+@@ current 233-251  ->  new 266-356 @@
+    233 
+    234 
+-   235 def _ddy(f, dy, cuts):
+-   236     """dF/dy in index space, centred (as BOUT's DDY: /2dy), one-sided at cuts."""
+-   237     ny = f.shape[1]
+-   238     valid = np.ones(ny - 1, dtype=bool)
+-   239     valid[list(cuts)] = False
+-   240     out = np.full_like(f, np.nan, dtype=float)
+-   241     for j in range(ny):
+-   242         up = j < ny - 1 and valid[j]
+-   243         dn = j > 0 and valid[j - 1]
+-   244         if up and dn:
+-   245             out[:, j] = (f[:, j + 1] - f[:, j - 1]) / (2.0 * dy[:, j])
+-   246         elif up:
+-   247             out[:, j] = (f[:, j + 1] - f[:, j]) / dy[:, j]
+-   248         elif dn:
+-   249             out[:, j] = (f[:, j] - f[:, j - 1]) / dy[:, j]
++   268 def _y_neighbours(R, Z, rm, zm, cuts):
++   269     """
++   270     (up, dn): y index of the cell across the yhigh / ylow face of (i, j) on the
++   271     same ring, or -1 at a target.
++   272 
++   273     With the gridue corner mesh, the neighbour across a face is the cell that
++   274     shares both of its corners, so branch cuts connect to their true spatial
++   275     neighbours (as BOUT's communication does). Without it, index neighbours
++   276     with every cut treated as a boundary.
++   277     """
++   278     nx, ny = R.shape
++   279     up = np.tile(np.arange(ny) + 1, (nx, 1))
++   280     dn = np.tile(np.arange(ny) - 1, (nx, 1))
++   281     up[:, -1] = -1
++   282     dn[:, 0] = -1
++   283     for c in cuts:
++   284         up[:, c] = -1
++   285         dn[:, c + 1] = -1
++   286     if rm is None or zm is None:
++   287         return up, dn
++   288 
++   289     scale = float(np.nanmax(np.abs(R)))
++   290     key = lambda r, z: (round(r / scale, 7), round(z / scale, 7))  # noqa: E731
++   291     cen = np.stack([rm[..., 0].ravel(), zm[..., 0].ravel()], axis=1)
++   292     cells = {}
++   293     for i in range(nx):
++   294         for j in range(ny):
++   295             d = np.hypot(cen[:, 0] - R[i, j], cen[:, 1] - Z[i, j])
++   296             k = int(np.argmin(d))
++   297             if d[k] < 1e-6 * scale:
++   298                 cells[np.unravel_index(k, rm.shape[:2])] = (i, j)
++   299 
++   300     def face(g, a, b):
++   301         return frozenset((key(rm[g][a], zm[g][a]), key(rm[g][b], zm[g][b])))
++   302 
++   303     by_face = {}
++   304     for g in cells:
++   305         for a, b in ((1, 3), (2, 4)):
++   306             by_face.setdefault(face(g, a, b), []).append(g)
++   307 
++   308     glist = list(cells)
++   309     corners = {(a, b): np.array([[[rm[h][a], zm[h][a]], [rm[h][b], zm[h][b]]] for h in glist])
++   310                for a, b in ((1, 3), (2, 4))}
++   311 
++   312     def across(g, a, b):
++   313         other = [h for h in by_face[face(g, a, b)]
++   314                  if h != g and cells[h][0] == cells[g][0]]
++   315         if other:
++   316             return cells[other[0]][1]
++   317         mine = np.array([[rm[g][a], zm[g][a]], [rm[g][b], zm[g][b]]])
++   318         opp = corners[(2, 4) if a == 1 else (1, 3)]
++   319         d = np.minimum(np.max(np.linalg.norm(opp - mine, axis=-1), axis=-1),
++   320                        np.max(np.linalg.norm(opp - mine[::-1], axis=-1), axis=-1))
++   321         k = int(np.argmin(d))
++   322         if (glist[k] != g and cells[glist[k]][0] == cells[g][0]
++   323                 and d[k] < 1e-2 * np.linalg.norm(mine[0] - mine[1])):
++   324             return cells[glist[k]][1]
++   325         return -1
++   326 
++   327     hi = np.full((nx, ny), -1)
++   328     lo = np.full((nx, ny), -1)
++   329     for g, (i, j) in cells.items():
++   330         hi[i, j] = across(g, 1, 3)
++   331         lo[i, j] = across(g, 2, 4)
++   332     matched = np.zeros((nx, ny), bool)
++   333     for i, j in cells.values():
++   334         matched[i, j] = True
++   335     if np.mean(hi[matched] == up[matched]) < np.mean(lo[matched] == up[matched]):
++   336         hi, lo = lo, hi
++   337     rows = np.where(matched.any(axis=1))[0]
++   338     for i in range(nx):
++   339         src = i if matched[i].all() else rows[np.argmin(np.abs(rows - i))]
++   340         up[i], dn[i] = hi[src], lo[src]
++   341     return up, dn
++   342 
++   343 
++   344 def _ddy(f, dy, nbr):
++   345     """dF/dy in index space, centred (as BOUT's DDY: /2dy) across true y
++   346     neighbours ``nbr = (up, dn)``, one-sided at the targets."""
++   347     up, dn = nbr
++   348     rows = np.arange(f.shape[0])[:, None]
++   349     fu = np.where(up >= 0, f[rows, np.clip(up, 0, None)], np.nan)
++   350     fd = np.where(dn >= 0, f[rows, np.clip(dn, 0, None)], np.nan)
++   351     both = (up >= 0) & (dn >= 0)
++   352     out = np.where(both, (fu - fd) / (2.0 * dy),
++   353                    np.where(up >= 0, (fu - f) / dy, (f - fd) / dy))
++   354     out[(up < 0) & (dn < 0)] = np.nan
+    250     return out
+    251 
+@@ current 281-284  ->  new 386-390 @@
+    281     hthe, dx, dy = gv("hthe"), gv("dx"), gv("dy")
+    282     g11, g23, J = gv("g11"), gv("g23"), gv("J")
++   388     bxcvx, bxcvy = gv("bxcvx"), gv("bxcvy")
+    283     if R is None or Z is None or dx is None or dy is None:
+    284         sys.exit(f"[{BANNER}] Grid lacks Rxy/Zxy/dx/dy with shape ({nx}, {ny}).")
+@@ current 286-293  ->  new 392-405 @@
+    286         B = np.sqrt(Bp ** 2 + Bt ** 2)
+    287     cuts = _cut_interfaces(g, ny, ny_inner)
++   394     rm = g["rm"].values if "rm" in g else None
++   395     zm = g["zm"].values if "zm" in g else None
++   396     nbr = _y_neighbours(R, Z, rm, zm, cuts)
++   397     linked = [(c, int(np.sum(nbr[0][:, c] >= 0))) for c in cuts]
++   398     print(f"[{BANNER}] y-faces linked across each cut (x points with a neighbour, "
++   399           f"of {nx}): " + ", ".join(f"after j={c}: {n}" for c, n in linked))
+    288 
+    289     if hthe is None:
+    290         # Poloidal length per unit y from the cell-centre positions.
+-   291         hthe = np.hypot(_ddy(R, dy, cuts), _ddy(Z, dy, cuts))
++   403         hthe = np.hypot(_ddy(R, dy, nbr), _ddy(Z, dy, nbr))
+    292         print(f"[{BANNER}] No hthe in grid; using |d(R,Z)/dy| from Rxy/Zxy.")
+    293     if g11 is None:
+@@ current 323-331  ->  new 435-444 @@
+    323     seps = sorted(i for i in (ix1, ix2) if 0 < i < nx)
+    324     return dict(
+-   325         grid=g, rm=g["rm"].values if "rm" in g else None,
+-   326         zm=g["zm"].values if "zm" in g else None,
+-   327         ny_inner=ny_inner, bridge_cut=single_null, cuts=cuts,
++   437         grid=g, rm=rm, zm=zm,
++   438         ny_inner=ny_inner, bridge_cut=single_null, cuts=cuts, nbr=nbr,
+    328         R=R, Z=Z, B=B, Bp=Bp, Bt=Bt, hthe=hthe, dx=dx, dy=dy,
+    329         g11=g11, g23=g23, J=J,
++   441         Cx=None if bxcvx is None else 2.0 * bxcvx / B,
++   442         Cy=None if bxcvy is None else 2.0 * bxcvy / B,
+    330         ix_sep=seps[0], ix_sep2=seps[1] if len(seps) > 1 else None,
+    331     )
+@@ current 384-387  ->  new 497-527 @@
+    384 
+    385 
++   499 def _charged_pressure(src, heat, run):
++   500     """Time-averaged sum of P_s [Pa] over the electrons and the ions, or None."""
++   501     Ps = [heat._tavg(src[f"P{s}"], run["t0"], run["t1"]) for s in ["e"] + run["ions"]
++   502           if f"P{s}" in src.data_vars]
++   503     return sum(Ps) if Ps else None
++   504 
++   505 
++   506 def _divjdia(P, geo):
++   507     """div(P Curlb_B) [A/m^3] in the form of BOUT's Div(Vector3D), d/dz = 0."""
++   508     Fx = geo["J"] * P * geo["Cx"]
++   509     Fy = geo["J"] * P * geo["Cy"]
++   510     return (_ddx(Fx, geo["dx"]) + _ddy(Fy, geo["dy"], geo["nbr"])) / geo["J"]
++   511 
++   512 
++   513 def _anomalous_flow_xlow(n, D, geo):
++   514     """
++   515     Anomalous particle flow [s^-1] through the xlow face of each cell, as
++   516     Div_a_Grad_perp_upwind_flows writes it (+ = increasing x). Cell 0 has none.
++   517     """
++   518     Jg = geo["J"] * geo["g11"]
++   519     grad = (Jg[:-1] + Jg[1:]) * (n[1:] - n[:-1]) / (geo["dx"][:-1] + geo["dx"][1:])
++   520     a = np.where(grad > 0, D[1:], D[:-1])
++   521     flow = np.zeros_like(n, dtype=float)
++   522     flow[1:] = -grad * a * geo["dy"][:-1] * 2 * np.pi
++   523     return flow
++   524 
++   525 
+    386 def compute_fields(run, geo, heat):
+    387     """
+@@ current 404-407  ->  new 544-553 @@
+    404         f["Mach"] = f["Vi"] / cs
+    405 
++   546     f["Pch"] = _charged_pressure(ds, heat, run)
++   547     if f["DivJdia"] is None and f["Pch"] is not None and geo["Cx"] is not None:
++   548         f["DivJdia"] = _divjdia(f["Pch"], geo)
++   549         print(f"[{BANNER}] {run['label']}: no DivJdia in the dump; reconstructed "
++   550               f"from sum P_s * 2 bxcv / B.")
++   551 
+    406     if f["phi"] is None:
+    407         print(f"[{BANNER}] {run['label']}: no phi in the dump -> no drift fields "
+@@ current 411-415  ->  new 557-561 @@
+    411     phi = f["phi"]
+    412     dpdx = _ddx(phi, geo["dx"])
+-   413     dpdy = _ddy(phi, geo["dy"], geo["cuts"])
++   559     dpdy = _ddy(phi, geo["dy"], geo["nbr"])
+    414     fac = geo["g11"] * geo["g23"] / geo["B"] ** 2
+    415     vx = fac * dpdy                                      # contravariant v^x
+@@ current 427-439  ->  new 573-597 @@
+    427     f["flowEx"] = n * vx * geo["J"] * geo["dy"] * 2 * np.pi     # [s^-1]
+    428     pfx = avg(f"pf{ion}_tot_xlow") if ion else None
++   575     origin = f"pf{ion}_tot_xlow"
++   576     D = avg(f"anomalous_D_{ion}") if ion else None
++   577     if pfx is None and D is not None:
++   578         pfx = _anomalous_flow_xlow(n, D, geo)
++   579         origin = f"anomalous_D_{ion} and N{ion} (reconstructed)"
+    429     if pfx is None:
+-   430         # anomalous_diffusion only writes particle_flow_xlow when anomalous_D is
+-   431         # set (input or grid D_<species>); with D = 0 there is nothing to compare.
+-   432         print(f"[{BANNER}] {run['label']}: no pf{ion}_tot_xlow in the dump "
+-   433               f"(anomalous_D = 0?) -> ExB/anomalous ratio map skipped.")
++   581         print(f"[{BANNER}] {run['label']}: no pf{ion}_tot_xlow and no "
++   582               f"anomalous_D_{ion} in the dump -> ExB/anomalous ratio map skipped.")
++   583     elif not np.any(pfx[run["MXG"]:run["nx"] - run["MXG"]]):
++   584         print(f"[{BANNER}] {run['label']}: anomalous radial particle flow is zero "
++   585               f"everywhere (anomalous_D_{ion} = 0: neither [{ion}] anomalous_D nor "
++   586               f"grid D_{ion} is set). ExB is the only cross-field ion transport; "
++   587               f"ratio map skipped.")
+    434     else:
++   589         anom = np.full_like(pfx, np.nan, dtype=float)
++   590         anom[:-1] = 0.5 * (pfx[:-1] + pfx[1:])
++   591         f["flowAnom"] = anom
+    435         with np.errstate(divide="ignore", invalid="ignore"):
+-   436             f["ratio"] = np.where(np.abs(pfx) > 0,
+-   437                                   np.abs(f["flowEx"]) / np.abs(pfx), np.nan)
++   593             f["ratio"] = np.where(np.abs(anom) > 0,
++   594                                   np.abs(f["flowEx"]) / np.abs(anom), np.nan)
++   595         print(f"[{BANNER}] {run['label']}: anomalous radial flow from {origin}.")
+    438     return f
+    439 
+@@ current 463-466  ->  new 621-625 @@
+    463     pf = avg(f"pf{ion}_tot_ylow") if ion else None
+    464     ef = [a for a in (avg(f"ef{s}_tot_ylow") for s in run["species"]) if a is not None]
++   623     Pch = _charged_pressure(src, heat, run)
+    465 
+    466     out = []
+@@ current 487-494  ->  new 646-673 @@
+    487         d["jin"] = None if jf_face is None else sgn * jf_face
+    488         d["I"] = np.nan if jf_face is None else float(np.sum((d["jin"] * area)[sx]))
++   648         if Pch is not None and geo["Cy"] is not None:
++   649             Iy = sgn * face(Pch) * geo["Cy"][:, j] * geo["J"][:, j] * geo["dx"][:, j] * 2 * np.pi
++   650             d["I_dia"] = float(np.sum(Iy[sx]))
++   651         else:
++   652             d["I_dia"] = np.nan
+    489         with np.errstate(divide="ignore", invalid="ignore"):
+    490             d["phi_Te"] = None if phi is None else d["phi"] / d["Te"]
+    491         out.append(d)
+    492     return out
++   657 
++   658 
++   659 def radial_dia_current(run, f, geo):
++   660     """
++   661     Net J_dia current [A] OUT of the domain through the inner (core + PF) and
++   662     outer (wall) x boundaries, from the x-face average of J P Curlb_B^x dy dz.
++   663     Returns (inner, outer) or None.
++   664     """
++   665     if f.get("Pch") is None or geo["Cx"] is None:
++   666         return None
++   667     flux = geo["J"] * f["Pch"] * geo["Cx"] * geo["dy"] * 2 * np.pi
++   668     m, nx = run["MXG"], run["nx"]
++   669     inner = -0.5 * (flux[m - 1] + flux[m])
++   670     outer = 0.5 * (flux[nx - m - 1] + flux[nx - m])
++   671     return float(np.nansum(inner)), float(np.nansum(outer))
+    493 
+    494 
+@@ current 532-536  ->  new 711-751 @@
+    532                     vmin=vmin, vmax=vmax, colorbar_label=label, log=log,
+    533                     bridge_cut=geo["bridge_cut"])
++   713     _overlay(ax, pp, geo, args)
+    534     ax.set_title(title or f"{name}   [{run['label']}]", fontsize=11)
++   715     plt.tight_layout()
++   716     _save(fig, args, name)
++   717 
++   718 
++   719 def _overlay(ax, pp, geo, args):
++   720     """Separatrices and branch cuts on a polygon map, as --seps / --branch_cuts ask."""
++   721     if args.seps:
++   722         pp.plot_separatrices(ax, geo["rm"], geo["zm"], geo["grid"], geo["ny_inner"])
++   723     if args.branch_cuts:
++   724         pp.plot_branch_cuts(ax, geo["rm"], geo["zm"], geo["grid"], geo["ny_inner"])
++   725 
++   726 
++   727 def _map_pair(pp, heat, runs, geo, a, b, label, name, kind, args):
++   728     """The same field for two runs side by side, on one shared colour scale."""
++   729     if a is None or b is None:
++   730         print(f"[{BANNER}] Skipping {name}: field missing in one of the runs.")
++   731         return
++   732     if geo["rm"] is None:
++   733         print(f"[{BANNER}] Grid has no rm/zm corner mesh; cannot draw maps.")
++   734         return
++   735     m, nx = runs[0]["MXG"], runs[0]["nx"]
++   736     both = np.concatenate([a[m:nx - m].ravel(), b[m:nx - m].ravel()])
++   737     log = kind == "log"
++   738     if log:
++   739         pos = both[np.isfinite(both) & (both > 0)]
++   740         vmin, vmax = (float(pos.min()), float(pos.max())) if pos.size else (None, None)
++   741     else:
++   742         vmin, vmax = heat._clim(both, args.clip)
++   743     fig, axs = plt.subplots(1, 2, figsize=(11, 10))
++   744     for ax, data, run in zip(axs, (a, b), runs):
++   745         pp.polygon_plot(ax, geo["rm"], geo["zm"], data, geo["ny_inner"], cmap="viridis",
++   746                         vmin=vmin, vmax=vmax, colorbar_label=label, log=log,
++   747                         bridge_cut=geo["bridge_cut"])
++   748         _overlay(ax, pp, geo, args)
++   749         ax.set_title(run["label"], fontsize=11)
+    535     plt.tight_layout()
+    536     _save(fig, args, name)
+@@ current 667-670  ->  new 882-889 @@
+    667         ("T1_phi", s("phi"), r"$\phi$ [V]", "div"),
+    668         ("T1_phi_over_Te", s("phi_Te"), r"$\phi / T_e$", "div"),
++   884         ("T1_Er", s("Er", 1e-3), r"$E_r$ [kV/m]  (+ = increasing x)", "div"),
++   885         ("T1_Epol", s("Epol", 1e-3), r"$E_{pol}$ [kV/m]  (+ = increasing y)", "div"),
++   886         ("T1_vE_radial", s("vEr"), r"$v_{E,r}$ [m/s]  (+ = increasing x)", "div"),
++   887         ("T1_vE_poloidal", s("vEpol"), r"$v_{E,pol}$ [m/s]  (+ = increasing y)", "div"),
+    669         ("T1_GammaE_radial", s("GammaEr"),
+    670          rf"$n_{{{ion}}} v_{{E,r}}$ [m$^{{-2}}$ s$^{{-1}}$]", "div"),
+@@ current 781-785  ->  new 1000-1005 @@
+    781     cols = [("Ne", r"$n_e$ [m$^{-3}$]", 1), ("Te", r"$T_e$ [eV]", 1),
+    782             ("Gamma", r"$\Gamma_\parallel$ [m$^{-2}$s$^{-1}$]", 1),
+-   783             ("q", r"$q_\parallel$ [MW/m$^2$]", 1e-6), ("phi_Te", r"$\phi/T_e$", 1),
++  1002             ("q", r"$q_\parallel$ [MW/m$^2$]", 1e-6), ("phi", r"$\phi$ [V]", 1),
++  1003             ("phi_Te", r"$\phi/T_e$", 1),
+    784             ("jin", r"$j_\parallel$ into target [kA/m$^2$]", 1e-3)]
+    785     fig, axs = plt.subplots(n_t, len(cols), figsize=(3.2 * len(cols), 2.8 * n_t),
+@@ current 851-899  ->  new 1071-1148 @@
+    851 # ══════════════════════════════════════════════════════════════════════════════
+    852 
+-   853 def tier3(runs, tdata, heat, args):
++  1073 def tier3(runs, fields, tdata, geo, heat, args):
++  1074     """
++  1075     Power, particle flow and the current budget per strike point. Returns one
++  1076     dict per run (case, family, P and F per target slot) for the all-case summary.
++  1077     """
+    854     m1s = [heat.method1_energy_flow(run) for run in runs]
+    855     slots = [s for s, t in enumerate(runs[0]["targets"]) if t is not None]
+    856     names = [heat.TARGET_SHORT[s] for s in slots]
+    857     x = np.arange(len(slots))
++  1082     xc = np.arange(len(slots) + 2)
+    858     w = 0.8 / len(runs)
+-   859     fig, axs = plt.subplots(1, 3, figsize=(15, 4.5))
++  1084     fig, axs = plt.subplots(1, 3, figsize=(17, 4.8),
++  1085                             gridspec_kw=dict(width_ratios=[1, 1, 1.4]))
+    860 
+    861     print(f"\n[{BANNER}] Per-strike-point budget (avg over last {args.twindow} steps)")
+    862     lw = max(20, max(len(r["label"]) for r in runs) + 2)
+    863     print(f"  {'run':<{lw}}{'target':<11}{'P [MW]':>10}{'flow [s^-1]':>14}"
+-   864           f"{'I_in [A]':>12}")
+-   865     for k, (run, m1, td) in enumerate(zip(runs, m1s, tdata)):
+-   866         P, F, I = [], [], []
++  1090           f"{'I_par [A]':>12}{'I_dia [A]':>12}")
++  1091     budgets = []
++  1092     for k, (run, f, m1, td) in enumerate(zip(runs, fields, m1s, tdata)):
++  1093         drift = f.get("phi") is not None
++  1094         P, F, Ip, Id = [], [], [], []
+    867         for s in slots:
+    868             pt = m1["per_target"][s]
+    869             P.append(1e-6 * pt["power"] if pt else np.nan)
+    870             F.append(pt["flux"] if pt else np.nan)
+-   871             I.append(td[s]["I"] if td[s] else np.nan)
++  1099             Ip.append(td[s]["I"] if td[s] else np.nan)
++  1100             Id.append(td[s]["I_dia"] if (td[s] and drift) else np.nan)
+    872             print(f"  {run['label']:<{lw}}{heat.TARGET_SHORT[s]:<11}{P[-1]:>10.4f}"
+-   873                   f"{F[-1]:>14.3e}{I[-1]:>12.2f}")
+-   874         tot_I = np.nansum(I)
++  1102                   f"{F[-1]:>14.3e}{Ip[-1]:>12.2f}{Id[-1]:>12.2f}")
++  1103         rad = radial_dia_current(run, f, geo) if drift else None
+    875         print(f"  {run['label']:<{lw}}{'SUM':<11}{np.nansum(P):>10.4f}"
+-   876               f"{np.nansum(F):>14.3e}{tot_I:>12.2f}"
+-   877               f"   <- net current should be ~0")
++  1105               f"{np.nansum(F):>14.3e}{np.nansum(Ip):>12.2f}{np.nansum(Id):>12.2f}")
++  1106         if rad is not None:
++  1107             total = np.nansum(Ip) + np.nansum(Id) + rad[0] + rad[1]
++  1108             print(f"  {run['label']:<{lw}}J_dia out through inner x boundary "
++  1109                   f"{rad[0]:>10.2f} A, outer x boundary {rad[1]:>10.2f} A")
++  1110             print(f"  {run['label']:<{lw}}NET current out of the domain "
++  1111                   f"{total:>10.2f} A   <- should be ~0  "
++  1112                   f"(scale: sum |I_par| = {np.nansum(np.abs(Ip)):.2f} A)")
++  1113         else:
++  1114             total = np.nansum(Ip)
++  1115             print(f"  {run['label']:<{lw}}no phi -> no charge balance in this "
++  1116                   f"model; J_dia not counted")
++  1117 
+    878         c = RUN_COLORS[k % len(RUN_COLORS)]
+    879         off = (k - (len(runs) - 1) / 2) * w
+    880         axs[0].bar(x + off, P, w, color=c, label=run["label"])
+    881         axs[1].bar(x + off, F, w, color=c, label=run["label"])
+-   882         axs[2].bar(x + off, I, w, color=c,
+-   883                    label=f"{run['label']}  (sum {tot_I:.1f} A)")
+-   884     for ax, lab in zip(axs, ["plasma power to target [MW]",
+-   885                              f"ion flow to target [s$^{{-1}}$]",
+-   886                              "net current into target [A]"]):
+-   887         ax.set_xticks(x)
+-   888         ax.set_xticklabels(names)
++  1122         Ipc = np.array(Ip + [0.0, 0.0])
++  1123         Idc = np.nan_to_num(np.array(Id + (list(rad) if rad else [np.nan, np.nan])))
++  1124         axs[2].bar(xc + off, Ipc, w, color=c,
++  1125                    label=f"{run['label']}  (net {total:.1f} A)")
++  1126         axs[2].bar(xc + off, Idc, w, bottom=Ipc, color=c, alpha=0.45, hatch="//",
++  1127                    edgecolor="k", lw=0.3)
++  1128         budgets.append(dict(case=run["case"], family=run["family"],
++  1129                             P=dict(zip(slots, P)), F=dict(zip(slots, F))))
++  1130     for ax, lab, ticks, tl in ((axs[0], "plasma power to target [MW]", x, names),
++  1131                                (axs[1], "ion flow to target [s$^{-1}$]", x, names),
++  1132                                (axs[2], "current out of the domain [A]", xc,
++  1133                                 names + ["inner x\nbdry", "outer x\nbdry"])):
++  1134         ax.set_xticks(ticks)
++  1135         ax.set_xticklabels(tl, fontsize=9)
+    889         ax.set_ylabel(lab)
+    890         ax.axhline(0, color="k", lw=0.5)
+    891         ax.grid(alpha=0.3, axis="y")
+-   892         ax.legend(fontsize="small")
+-   893     fig.suptitle("Tier 3 — per strike point")
++  1139         ax.legend(fontsize="x-small")
++  1140     h, lab = axs[2].get_legend_handles_labels()
++  1141     axs[2].legend(h + [Patch(facecolor="w", hatch="//", edgecolor="k")],
++  1142                   lab + [r"hatched: $J_{dia}$ part"], fontsize="x-small")
++  1143     fig.suptitle(f"Tier 3 — per strike point   [{runs[0]['case']}]")
+    894     plt.tight_layout()
+    895     _save(fig, args, "T3_strike_points")
+    896 
+-   897     # Sheath potential vs the ambipolar (zero-current) value, from the heat script.
+    898     run = runs[0]
+    899     ion = run["ions"][0] if run["ions"] else None
+@@ current 911-914  ->  new 1160-1214 @@
+    911                     print(f"  {heat.TARGET_SHORT[s]:<11}{r['Te']:>9.2f}{r['phi']:>9.2f}"
+    912                           f"{r['ratio']:>9.2f}{r['amb']:>11.2f}{r['ve_cs']:>8.2f}")
++  1162     return budgets
++  1163 
++  1164 
++  1165 def summary_all_cases(budgets, heat, args):
++  1166     """Power and particle flow per strike point for every case, one bar per run family."""
++  1167     cases = [b[0]["case"] for b in budgets]
++  1168     families = list(dict.fromkeys(r["family"] for b in budgets for r in b))
++  1169     slots = sorted({s for b in budgets for r in b for s in r["P"]})
++  1170     rows = slots + ["total"]
++  1171     x = np.arange(len(cases))
++  1172     w = 0.8 / len(families)
++  1173     fig, axs = plt.subplots(len(rows), 2, figsize=(max(10, 1.4 * len(cases) + 4),
++  1174                                                    2.4 * len(rows)),
++  1175                             sharex=True, squeeze=False)
++  1176 
++  1177     def value(run, key, slot):
++  1178         if run is None:
++  1179             return np.nan
++  1180         if slot == "total":
++  1181             return np.nansum(list(run[key].values()))
++  1182         return run[key].get(slot, np.nan)
++  1183 
++  1184     print(f"\n[{BANNER}] All-case summary: power [MW] / ion flow [s^-1] per strike point")
++  1185     print(f"  {'case':<12}{'run':<12}" + "".join(
++  1186         f"{(heat.TARGET_SHORT[s] if s != 'total' else 'total'):>24}" for s in rows))
++  1187     for k, fam in enumerate(families):
++  1188         off = (k - (len(families) - 1) / 2) * w
++  1189         picked = [next((r for r in b if r["family"] == fam), None) for b in budgets]
++  1190         for r, slot in enumerate(rows):
++  1191             for col, key, fac in ((0, "P", 1.0), (1, "F", 1.0)):
++  1192                 axs[r, col].bar(x + off, [fac * value(p, key, slot) for p in picked], w,
++  1193                                 color=RUN_COLORS[k % len(RUN_COLORS)], label=fam)
++  1194         for case, p in zip(cases, picked):
++  1195             if p is None:
++  1196                 continue
++  1197             print(f"  {case:<12}{fam:<12}" + "".join(
++  1198                 f"{value(p, 'P', s):>11.4f} /{value(p, 'F', s):>11.3e}" for s in rows))
++  1199     for r, slot in enumerate(rows):
++  1200         name = heat.TARGET_SHORT[slot] if slot != "total" else "all targets"
++  1201         axs[r, 0].set_ylabel(f"{name}\nP [MW]", fontsize=9)
++  1202         axs[r, 1].set_ylabel(f"{name}\nion flow [s$^{{-1}}$]", fontsize=9)
++  1203         for ax in axs[r]:
++  1204             ax.grid(alpha=0.3, axis="y")
++  1205     axs[0, 0].legend(fontsize="small")
++  1206     for ax in axs[-1]:
++  1207         ax.set_xticks(x)
++  1208         ax.set_xticklabels(cases)
++  1209     fig.suptitle("Tier 3 — power and particle flow per strike point, all cases\n"
++  1210                  "(SN fills SP1 and SP2 only: its two legs at the poloidal ends)")
++  1211     plt.tight_layout()
++  1212     _save(fig, args, "T3_all_cases")
+    913 
+    914 
+@@ current 917-934  ->  new 1217-1281 @@
+    917 # ══════════════════════════════════════════════════════════════════════════════
+    918 
+-   919 def tier4(runs, fields, geo, pp, heat, args):
++  1219 DELTA_MAPS = [
++  1220     ("Te", r"$\Delta T_e$ [eV]", "T4_dTe", False, 1.0),
++  1221     ("Ti", r"$\Delta T_i$ [eV]", "T4_dTi", False, 1.0),
++  1222     ("Ne", r"$\Delta n_e / n_e$", "T4_dNe_rel", True, 1.0),
++  1223     ("Mach", r"$\Delta M_\parallel$", "T4_dMach", False, 1.0),
++  1224     ("jpar", r"$\Delta j_\parallel$ [kA/m$^2$]", "T4_djpar", False, 1e-3),
++  1225     ("phi", r"$\Delta \phi$ [V]", "T4_dphi", False, 1.0),
++  1226 ]
++  1227 
++  1228 
++  1229 def tier4(runs, fields, tdata, geo, pp, heat, args):
+    920     if len(runs) < 2:
+    921         print(f"[{BANNER}] Tier 4 needs --compare; skipping.")
+    922         return
+    923     a, b = fields[0], fields[1]
+-   924     lab = f"{runs[0]['label']} - {runs[1]['label']}"
+-   925     if a.get("Te") is not None and b.get("Te") is not None:
+-   926         _map(pp, heat, runs[0], geo, a["Te"] - b["Te"], rf"$\Delta T_e$ [eV]  ({lab})",
+-   927              "T4_dTe", "div", args, title=r"$\Delta T_e$")
+-   928     if a.get("Ne") is not None and b.get("Ne") is not None:
++  1234     lab = f"{runs[0]['family']} - {runs[1]['family']}"
++  1235     _map_pair(pp, heat, runs, geo, a.get("Ne"), b.get("Ne"), r"$n_e$ [m$^{-3}$]",
++  1236               "T4_Ne_side_by_side", "log", args)
++  1237     _map_pair(pp, heat, runs, geo, a.get("Te"), b.get("Te"), r"$T_e$ [eV]",
++  1238               "T4_Te_side_by_side", "log", args)
++  1239     for key, sym, name, rel, fac in DELTA_MAPS:
++  1240         if a.get(key) is None or b.get(key) is None:
++  1241             print(f"[{BANNER}] Skipping {name}: {key} missing in one of the runs.")
++  1242             continue
+    929         with np.errstate(divide="ignore", invalid="ignore"):
+-   930             rel = (a["Ne"] - b["Ne"]) / b["Ne"]
+-   931         _map(pp, heat, runs[0], geo, rel, rf"$\Delta n_e / n_e$  ({lab})",
+-   932              "T4_dNe_rel", "div", args, title=r"$\Delta n_e / n_e$")
++  1244             d = (a[key] - b[key]) / b[key] if rel else fac * (a[key] - b[key])
++  1245         _map(pp, heat, runs[0], geo, d, f"{sym}  ({lab})", name, "div", args,
++  1246              title=f"{sym}   [{runs[0]['case']}]")
++  1247     tier4_targets(runs, tdata, geo, args)
++  1248 
++  1249 
++  1250 def tier4_targets(runs, tdata, geo, args):
++  1251     """Run 1 minus run 2 for the sheath-face profiles at each strike point."""
++  1252     cols = [("Ne", r"$\Delta n_e$ [m$^{-3}$]", 1), ("Te", r"$\Delta T_e$ [eV]", 1),
++  1253             ("Gamma", r"$\Delta \Gamma_\parallel$ [m$^{-2}$s$^{-1}$]", 1),
++  1254             ("q", r"$\Delta q_\parallel$ [MW/m$^2$]", 1e-6)]
++  1255     a, b = tdata[0], tdata[1]
++  1256     slots = [s for s, d in enumerate(a) if d is not None and b[s] is not None]
++  1257     if not slots:
++  1258         return
++  1259     sx = slice(runs[0]["MXG"], runs[0]["nx"] - runs[0]["MXG"])
++  1260     fig, axs = plt.subplots(len(slots), len(cols), figsize=(3.4 * len(cols), 2.8 * len(slots)),
++  1261                             squeeze=False)
++  1262     for row, s in enumerate(slots):
++  1263         for c, (key, lab, fac) in enumerate(cols):
++  1264             ax = axs[row, c]
++  1265             if a[s].get(key) is not None and b[s].get(key) is not None:
++  1266                 ax.plot(1e3 * a[s]["r"][sx], fac * (a[s][key] - b[s][key])[sx], color="k")
++  1267             _mark_seps(ax, a[s]["r"], geo)
++  1268             ax.axhline(0, color="k", lw=0.5)
++  1269             ax.grid(alpha=0.3)
++  1270             if row == 0:
++  1271                 ax.set_title(lab, fontsize=10)
++  1272             if row == len(slots) - 1:
++  1273                 ax.set_xlabel(r"$r - r_{sep}$ along target [mm]")
++  1274             if c == 0:
++  1275                 ax.set_ylabel(a[s]["name"])
++  1276     fig.suptitle(f"Tier 4 — {runs[0]['family']} minus {runs[1]['family']} at each "
++  1277                  f"strike point   [{runs[0]['case']}]")
++  1278     plt.tight_layout()
++  1279     _save(fig, args, "T4_targets_delta")
+    933 
+    934 
+@@ current 937-995  ->  new 1284-1333 @@
+    937 # ══════════════════════════════════════════════════════════════════════════════
+    938 
+-   939 def main():
+-   940     parser = argparse.ArgumentParser(
+-   941         description="First-look drift plots for Hermes-3 relax_potential runs "
+-   942                     "(CLAUDE_DRIFTS.md §10).",
+-   943         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+-   944     parser.add_argument("grid_file", help="BOUT++ grid file (.nc)")
+-   945     parser.add_argument("sim_results", help="Directory of BOUT.dmp.*.nc (drift run)")
+-   946     parser.add_argument("--compare", default=None,
+-   947                         help="Second run (e.g. matched no-drift) on the same grid")
+-   948     parser.add_argument("--label", default=None, help="Label for the main run")
+-   949     parser.add_argument("--compare_label", default=None, help="Label for --compare")
+-   950     parser.add_argument("--tiers", default="0,1,2,3,4",
+-   951                         help="Comma-separated tiers to produce")
+-   952     parser.add_argument("--twindow", type=int, default=5,
+-   953                         help="Average maps/profiles over the last N timesteps")
+-   954     parser.add_argument("--ring", type=int, default=None,
+-   955                         help="x index for the along-ring profile "
+-   956                              "(default: first cell outside the first separatrix)")
+-   957     parser.add_argument("--clip", type=float, default=99.5,
+-   958                         help="Percentile for colour limits (100 = true extrema)")
+-   959     parser.add_argument("--outdir", default=None,
+-   960                         help="Output directory (default: <sim_results>/drifts_pp)")
+-   961     parser.add_argument("--fmt", default="png", help="Figure format")
+-   962     parser.add_argument("--show", action="store_true",
+-   963                         help="Also show the figures interactively")
+-   964     parser.add_argument("--pp_path", default=None,
+-   965                         help="Explicit path to Hermes-3_postprocessing.py")
+-   966     parser.add_argument("--heat_path", default=None,
+-   967                         help="Explicit path to hermes-heat-pp-method-comparison.py")
+-   968     args = parser.parse_args()
++  1286 def _str2bool(value):
++  1287     """Parse a CLI boolean so ``--drifts False`` works."""
++  1288     if isinstance(value, bool):
++  1289         return value
++  1290     if value.lower() in ("true", "t", "yes", "y", "1"):
++  1291         return True
++  1292     if value.lower() in ("false", "f", "no", "n", "0"):
++  1293         return False
++  1294     raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+    969 
+-   970     for p in (args.grid_file,):
+-   971         if not os.path.isfile(p):
+-   972             sys.exit(f"Grid file not found: {p}")
+-   973     for p in filter(None, (args.sim_results, args.compare)):
+-   974         if not os.path.isdir(p):
+-   975             sys.exit(f"Not a directory: {p}")
+-   976     tiers = {int(t) for t in args.tiers.split(",") if t.strip()}
+-   977     args.outdir = args.outdir or os.path.join(args.sim_results, "drifts_pp")
+-   978     os.makedirs(args.outdir, exist_ok=True)
+    979 
+-   980     pp = _load_module("hermes3_pp", _PP_CANDIDATES, args.pp_path)
+-   981     heat = _load_module("hermes_heat_pp", _HEAT_CANDIDATES, args.heat_path)
+-   982     _use_aligned_open(heat, pp)
++  1297 def _has_drifts(run):
++  1298     """True if the run computes phi: relax_potential or vorticity in [hermes] components."""
++  1299     try:
++  1300         comps = str(run["ds"].attrs["options"]["hermes"]["components"])
++  1301     except Exception:
++  1302         comps = ""
++  1303     return ("relax_potential" in comps or "vorticity" in comps
++  1304             or "phi" in run["ds"].data_vars)
+    983 
++  1306 
++  1307 def process_case(case, other, pp, heat, args, tiers):
++  1308     """Load one case (and its --compare match), run the tiers. Returns Tier 3 budgets."""
+    984     runs = []
+-   985     for path, lab in ((args.sim_results, args.label),
+-   986                       (args.compare, args.compare_label)):
+-   987         if path is None:
++  1310     for c, fam in ((case, args.label), (other, args.compare_label)):
++  1311         if c is None:
+    988             continue
+-   989         run = heat.load_run(path, args.grid_file, twindow=args.twindow)
+-   990         run["label"] = lab or os.path.basename(os.path.abspath(path))
++  1313         run = heat.load_run(c["path"], c["grid"], twindow=args.twindow)
++  1314         run.update(case=c["label"], family=fam, label=f"{c['label']} {fam}")
++  1315         run["drifts"] = _has_drifts(run)
+    991         runs.append(run)
+    992 
+-   993     geo = load_geometry(args.grid_file, runs[0])
++  1318     if runs[0]["drifts"] != args.drifts:
++  1319         print(f"[{BANNER}] WARNING: --drifts {args.drifts} but {case['label']} "
++  1320               f"{'has' if runs[0]['drifts'] else 'has no'} relax_potential/vorticity "
++  1321               f"in BOUT.settings. Figures still go to {args.outdir}.")
++  1322     if len(runs) > 1:
++  1323         if runs[1]["drifts"] == runs[0]["drifts"]:
++  1324             print(f"[{BANNER}] WARNING: the --compare run has the same drift setting "
++  1325                   f"as the main run; Tier 4 is then not drifts vs no drifts.")
++  1326         if (runs[1]["nx"], runs[1]["ny"]) != (runs[0]["nx"], runs[0]["ny"]):
++  1327             print(f"[{BANNER}] --compare run for {case['label']} is on a different "
++  1328                   f"mesh; dropping it.")
++  1329             runs = runs[:1]
++  1330 
++  1331     geo = load_geometry(case["grid"], runs[0])
+    994     seps = [geo["ix_sep"]] + ([geo["ix_sep2"]] if geo["ix_sep2"] is not None else [])
+    995     print(f"[{BANNER}] Separatrices at x = {seps}; "
+@@ current 1006-1019  ->  new 1344-1459 @@
+   1006         (2, "Tier 2 targets", lambda: tier2_targets(runs, tdata, geo, args)),
+   1007         (2, "Tier 2 ring", lambda: tier2_ring(runs, fields, geo, args)),
+-  1008         (3, "Tier 3", lambda: tier3(runs, tdata, heat, args)),
+-  1009         (4, "Tier 4", lambda: tier4(runs, fields, geo, pp, heat, args)),
++  1346         (3, "Tier 3", lambda: tier3(runs, fields, tdata, geo, heat, args)),
++  1347         (4, "Tier 4", lambda: tier4(runs, fields, tdata, geo, pp, heat, args)),
+   1010     ]
++  1349     budgets = None
+   1011     for tier, name, job in jobs:
+   1012         if tier not in tiers:
+   1013             continue
+   1014         try:
+-  1015             job()
++  1354             res = job()
++  1355             if tier == 3:
++  1356                 budgets = res
+   1016         except Exception:                      # one broken plot must not kill the rest
+   1017             print(f"[{BANNER}] {name} failed:")
++  1359             traceback.print_exc()
++  1360     return budgets
++  1361 
++  1362 
++  1363 def main():
++  1364     parser = argparse.ArgumentParser(
++  1365         description="First-look drift plots for Hermes-3 relax_potential runs "
++  1366                     "(CLAUDE_DRIFTS.md §10 and Appendix A).",
++  1367         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
++  1368     parser.add_argument("sims_dir",
++  1369                         help="Folder containing the SF<angle>/SN simulation folders")
++  1370     parser.add_argument("grid_dir",
++  1371                         help="Folder containing the grid files (*sf<angle>*.nc, *lsn*.nc)")
++  1372     parser.add_argument("--only", nargs="+", default=None, metavar="CASE",
++  1373                         help="Only load these sim folders, e.g. --only SF45 SF165")
++  1374     parser.add_argument("--drifts", type=_str2bool, default=True, metavar="True/False",
++  1375                         help="Are the sims_dir runs drift runs? Picks <outdir>/Drifts "
++  1376                              "or <outdir>/No_drifts, and is checked against BOUT.settings")
++  1377     parser.add_argument("--compare", default=None,
++  1378                         help="Second sims_dir (e.g. the matched no-drift runs); "
++  1379                              "each case is paired with the folder of the same name")
++  1380     parser.add_argument("--label", default=None,
++  1381                         help="Label for the sims_dir runs (default: drifts / no drifts)")
++  1382     parser.add_argument("--compare_label", default=None,
++  1383                         help="Label for the --compare runs (default: the opposite)")
++  1384     parser.add_argument("--tiers", default="0,1,2,3,4",
++  1385                         help="Comma-separated tiers to produce")
++  1386     parser.add_argument("--twindow", type=int, default=5,
++  1387                         help="Average maps/profiles over the last N timesteps")
++  1388     parser.add_argument("--ring", type=int, default=None,
++  1389                         help="x index for the along-ring profile "
++  1390                              "(default: first cell outside the first separatrix)")
++  1391     parser.add_argument("--clip", type=float, default=99.5,
++  1392                         help="Percentile for colour limits (100 = true extrema)")
++  1393     parser.add_argument("--seps", type=_str2bool, default=True, metavar="True/False",
++  1394                         help="Overlay the separatrices on the maps")
++  1395     parser.add_argument("--branch_cuts", type=_str2bool, default=True, metavar="True/False",
++  1396                         help="Overlay the branch cuts on the maps")
++  1397     parser.add_argument("--outdir",
++  1398                         default="/Users/sruiz/Dev/PhD/SF_Sims/Modified_SF_Runs/"
++  1399                                 "Post_Processing",
++  1400                         help="Figures go to <outdir>/<Drifts|No_drifts>/<case>/")
++  1401     parser.add_argument("--fmt", default="png", help="Figure format")
++  1402     parser.add_argument("--show", action="store_true",
++  1403                         help="Also show the figures interactively")
++  1404     parser.add_argument("--pp_path", default=None,
++  1405                         help="Explicit path to Hermes-3_postprocessing.py")
++  1406     parser.add_argument("--heat_path", default=None,
++  1407                         help="Explicit path to hermes-heat-pp-method-comparison.py")
++  1408     parser.add_argument("--sf_path", default=None,
++  1409                         help="Explicit path to SF_heat_transport_pp_xhermes_withfluxes.py")
++  1410     args = parser.parse_args()
++  1411 
++  1412     for d in filter(None, (args.sims_dir, args.grid_dir, args.compare)):
++  1413         if not os.path.isdir(d):
++  1414             sys.exit(f"Not a directory: {d}")
++  1415     tiers = {int(t) for t in args.tiers.split(",") if t.strip()}
++  1416     args.label = args.label or ("drifts" if args.drifts else "no drifts")
++  1417     args.compare_label = args.compare_label or ("no drifts" if args.drifts else "drifts")
++  1418     root = os.path.join(args.outdir, "Drifts" if args.drifts else "No_drifts")
++  1419     os.makedirs(root, exist_ok=True)
++  1420 
++  1421     pp = _load_module("hermes3_pp", _PP_CANDIDATES, args.pp_path)
++  1422     heat = _load_module("hermes_heat_pp", _HEAT_CANDIDATES, args.heat_path)
++  1423     _use_aligned_open(heat, pp)
++  1424     sf = heat._load_sf(args.sf_path)
++  1425 
++  1426     cases = sf.discover_cases(args.sims_dir, args.grid_dir, only=args.only)
++  1427     if not cases:
++  1428         sys.exit("No simulations found.")
++  1429     matched = {}
++  1430     if args.compare:
++  1431         matched = {c["label"]: c for c in
++  1432                    sf.discover_cases(args.compare, args.grid_dir, only=args.only)}
++  1433 
++  1434     budgets = []
++  1435     for case in cases:
++  1436         out = os.path.join(root, case["label"])
++  1437         os.makedirs(out, exist_ok=True)
++  1438         cargs = argparse.Namespace(**{**vars(args), "outdir": out})
++  1439         print(f"\n[{BANNER}] ══════ {case['label']}  ->  {out}")
++  1440         other = matched.get(case["label"])
++  1441         if args.compare and other is None:
++  1442             print(f"[{BANNER}] No {case['label']} in {args.compare}; Tier 4 skipped.")
++  1443         try:
++  1444             b = process_case(case, other, pp, heat, cargs, tiers)
++  1445         except Exception:
++  1446             print(f"[{BANNER}] {case['label']} failed:")
++  1447             traceback.print_exc()
++  1448             continue
++  1449         if b:
++  1450             budgets.append(b)
++  1451 
++  1452     if 3 in tiers and budgets:
++  1453         try:
++  1454             summary_all_cases(budgets, heat, argparse.Namespace(**{**vars(args),
++  1455                                                                    "outdir": root}))
++  1456         except Exception:
++  1457             print(f"[{BANNER}] All-case summary failed:")
+   1018             traceback.print_exc()
+   1019 

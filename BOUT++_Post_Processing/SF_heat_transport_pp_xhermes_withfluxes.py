@@ -147,13 +147,16 @@ def _tavg(da, t0, t1, poloidal_dim="theta"):
 # Sim folders are named SF<angle>[suffix] or SN[suffix]. The grid for SF<angle> is
 # the file in the grid folder whose name contains "sf<angle>" not followed by
 # another digit (sf75 -> mastu_sf75p_bout.grd.nc); SN takes the "lsn"/"sn" grid.
+# SF-ideal[suffix] (angle "ideal") takes the "sf_pro_max" grid.
 
-_CASE_RE = re.compile(r"^(?:SF(\d+)|SN)(.*)$", re.IGNORECASE)
+_CASE_RE = re.compile(r"^(?:SF(\d+)|(SF-?ideal)|SN)(.*)$", re.IGNORECASE)
 
 
 def _find_grid(grid_dir, angle):
     if angle is None:
         pat = re.compile(r"(?:^|_)l?sn(?:_|\.)", re.IGNORECASE)
+    elif angle == "ideal":
+        pat = re.compile(r"sf_pro_max", re.IGNORECASE)
     else:
         pat = re.compile(rf"sf{angle}(?!\d)", re.IGNORECASE)
     hits = sorted(f for f in glob.glob(os.path.join(grid_dir, "*.nc"))
@@ -170,9 +173,10 @@ def _nx(path):
 
 def discover_cases(sims_dir, grid_dir, only=None):
     """
-    Pair every SF<angle>/SN sim folder in ``sims_dir`` with its grid in ``grid_dir``.
+    Pair every SF<angle>/SF-ideal/SN sim folder in ``sims_dir`` with its grid in ``grid_dir``.
 
-    Returns a list of dicts (label, path, grid, color, ls) sorted by angle, SN last.
+    Returns a list of dicts (label, path, grid, color, ls) sorted by angle, then
+    SF-ideal, SN last.
     Variants of one angle (e.g. SF45-New_Limiter) share its colour, dashed.
     """
     only = {o.upper() for o in only} if only else None
@@ -188,7 +192,7 @@ def discover_cases(sims_dir, grid_dir, only=None):
         if not dumps:
             print(f"Skipping {name}: no BOUT.dmp / BOUT.squash files.")
             continue
-        angle = int(m.group(1)) if m.group(1) else None
+        angle = int(m.group(1)) if m.group(1) else "ideal" if m.group(2) else None
         try:
             grid = _find_grid(grid_dir, angle)
         except ValueError as e:
@@ -203,12 +207,14 @@ def discover_cases(sims_dir, grid_dir, only=None):
                   f"sim has nx={nx_sim}.")
             continue
         cases.append({"label": name, "path": path, "grid": grid,
-                      "angle": angle, "variant": bool(m.group(2))})
+                      "angle": angle, "variant": bool(m.group(3))})
     if only is not None:
         missing = only - {c["label"].upper() for c in cases}
         if missing:
             print(f"--only: not loaded: {sorted(missing)}")
-    cases.sort(key=lambda c: (c["angle"] is None, c["angle"] or 0, c["label"]))
+    cases.sort(key=lambda c: (c["angle"] is None, c["angle"] == "ideal",
+                              c["angle"] if isinstance(c["angle"], int) else 0,
+                              c["label"]))
     bases = list(dict.fromkeys(c["angle"] for c in cases))
     for c in cases:
         c["color"] = COLOR_CYCLE[bases.index(c["angle"]) % len(COLOR_CYCLE)]
@@ -1036,9 +1042,9 @@ def main():
                     "balance calculation (D, --ben_example_fluxes)."
     )
     parser.add_argument("sims_dir",
-                        help="Folder containing the SF<angle>/SN simulation folders")
+                        help="Folder containing the SF<angle>/SF-ideal/SN simulation folders")
     parser.add_argument("grid_dir",
-                        help="Folder containing the grid files (*sf<angle>*.nc, *lsn*.nc)")
+                        help="Folder containing the grid files (*sf<angle>*.nc, *sf_pro_max*.nc, *lsn*.nc)")
     parser.add_argument("--only", nargs="+", default=None, metavar="CASE",
                         help="Only load these sim folders, e.g. --only SF15 SF45 SN")
     parser.add_argument("--twindow", type=int, default=20,
@@ -1071,6 +1077,9 @@ def main():
                         help="Also produce the equilibrium 3-panel figure: safety "
                              "factor q(rho_N), magnetic shear s(rho_N), and LFS "
                              "connection length L_par/rho_s0 (Giacomin Fig. 3 style).")
+    parser.add_argument("--output", type=str, default=None, metavar="TAG",
+                        help="Extra tag appended to every saved figure name, "
+                             "e.g. --output No-drifts -> SF_heat_flux_targets_A_No-drifts.pdf")
     args = parser.parse_args()
     if args.ben_example_fluxes and args.analytic_power:
         parser.error("--ben_example_fluxes and --analytic_power cannot be combined.")
@@ -1086,9 +1095,10 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     approach_tag = ("D_strict" if args.ben_strict else "D" if args.ben_example_fluxes
                     else "C" if args.analytic_power else "A")
+    out_sfx = f"_{args.output}" if args.output else ""
 
     if args.plot_grids:
-        plot_grids(cases, os.path.join(script_dir, "SF_grids"))
+        plot_grids(cases, os.path.join(script_dir, f"SF_grids{out_sfx}"))
 
     datasets, labels, colors, lstyles = [], [], [], []
     for c in cases:
@@ -1125,7 +1135,7 @@ def main():
         q_key   = "q",
         ylabel  = r"$q_\parallel\;[\mathrm{MW\,m}^{-2}]$",
         title   = r"Total parallel heat flux ($q_e + q_i$) at divertor targets",
-        out_path= os.path.join(script_dir, f"SF_heat_flux_targets_{approach_tag}"),
+        out_path= os.path.join(script_dir, f"SF_heat_flux_targets_{approach_tag}{out_sfx}"),
         xlim    = args.xlim, ylim = args.ylim,
     )
 
@@ -1135,7 +1145,7 @@ def main():
         q_key   = "q_norm",
         ylabel  = r"$q_\parallel\,/\,q_0$",
         title   = r"Normalised parallel heat flux ($q_e + q_i$) / $q_0$ at divertor targets",
-        out_path= os.path.join(script_dir, f"SF_heat_flux_targets_normalised_{approach_tag}"),
+        out_path= os.path.join(script_dir, f"SF_heat_flux_targets_normalised_{approach_tag}{out_sfx}"),
         xlim    = args.xlim, ylim = args.ylim_norm,
     )
 
@@ -1157,7 +1167,7 @@ def main():
     ax3.legend(fontsize=9)
     ax3.grid(True, axis="y", alpha=0.25)
     plt.tight_layout()
-    out_frac = os.path.join(script_dir, f"SF_power_fractions_{approach_tag}")
+    out_frac = os.path.join(script_dir, f"SF_power_fractions_{approach_tag}{out_sfx}")
     plt.savefig(out_frac + ".pdf", bbox_inches="tight")
     plt.savefig(out_frac + ".png", dpi=150, bbox_inches="tight")
     print(f"Saved: {out_frac}.pdf / .png")
@@ -1174,7 +1184,7 @@ def main():
                 print(f"--flux_profiles: could not build profiles for {c['label']}: {e}")
         if profiles:
             plot_flux_surface_figure(profiles, fp_labels, fp_colors, fp_lstyles,
-                                     os.path.join(script_dir, "SF_flux_surface_profiles"))
+                                     os.path.join(script_dir, f"SF_flux_surface_profiles{out_sfx}"))
 
     plt.show()
 

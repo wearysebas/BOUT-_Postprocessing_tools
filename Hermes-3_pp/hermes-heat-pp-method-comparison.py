@@ -3,7 +3,7 @@
 hermes-heat-pp.py — power-balance audit for Hermes-3 runs.
 
 Answers one question: **does the power that goes in come back out?**  The same
-number is computed four independent ways and printed side by side, so a leak
+number is computed five independent ways and printed side by side, so a leak
 shows up as a disagreement between them rather than as a plausible-looking
 single number.
 
@@ -33,6 +33,13 @@ single number.
         `final_source`, i.e. ONLY the external source from the input file
         (`[Pe] source`, `[Pd+] source`, times the time-dependent prefactor).
         This is the ground truth "how many watts am I putting in".
+
+    METHOD 5 — Ben's sheath and balance calculation       (SF script "approach D")
+        compute_balance from SF_heat_transport_pp_xhermes_withfluxes.py
+        (analyse_fluxes.py adapted to SF, CLAUDE_BEN_FLUXES.md): sheath power
+        from limitFree guard values and q = gamma n T max(V, Cs), plus radial
+        anomalous flows, radiation and the full power/particle balance.  Last
+        time step only, not the --twindow average.
 
     Plus: an effective sheath transmission coefficient gamma_eff back-computed
     from method 1's power and the particle flow pf<ion>_tot_ylow.  For
@@ -69,19 +76,23 @@ TWO GOTCHAS THIS SCRIPT FIXES RELATIVE TO SF_heat_transport_pp_xhermes.py
 --------------------------------------------------------------------------------
 Usage
 --------------------------------------------------------------------------------
-    python hermes-heat-pp.py <grid_file> <sim_results_dir> [options]
+    python hermes-heat-pp.py <sims_dir> <grid_dir> [--only SF45 ...] [options]
+
+    Every SF<angle>/SN folder in sims_dir is paired with its grid in grid_dir
+    (discover_cases from SF_heat_transport_pp_xhermes_withfluxes.py).
 
     # numbers only, no figure
-    python hermes-heat-pp.py mastu_sf45_bout.grd.nc runs/sf45 --plot False
+    python hermes-heat-pp.py runs grids --only SF45 --plot False
 
     # where is the power being deposited / lost?
-    python hermes-heat-pp.py mastu_sf45_bout.grd.nc runs/sf45 --var Pother --seps
+    python hermes-heat-pp.py runs grids --only SF45 --var Pother --seps
 """
 
 import argparse
 import glob
 import importlib.util
 import os
+import re
 import sys
 import warnings
 
@@ -109,6 +120,9 @@ _PP_CANDIDATES = [
                        "Hermes-3_postprocessing.py"),
 ]
 
+_SF_PATH = os.path.expanduser("~/Dev/My_working_scripts/BOUT++_Post_Processing/"
+                              "SF_heat_transport_pp_xhermes_withfluxes.py")
+
 BANNER = "hermes-heat-pp"
 
 
@@ -132,6 +146,21 @@ def _load_pp(explicit=None):
           f"(looked in {_PP_CANDIDATES}); plotting disabled. "
           f"Pass --pp_path to point at it.")
     return None
+
+
+def _load_sf(path=None):
+    """
+    Import ``SF_heat_transport_pp_xhermes_withfluxes.py`` by path, for its
+    case discovery (``discover_cases``) and Ben's balance (``compute_balance``).
+    """
+    path = path or _SF_PATH
+    if not os.path.isfile(path):
+        sys.exit(f"Could not find {path}; pass --sf_path to point at it.")
+    spec = importlib.util.spec_from_file_location("sf_heat_pp", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    print(f"[{BANNER}] Case discovery from {path}")
+    return mod
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -722,6 +751,37 @@ def sheath_potential_check(run, m2):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# METHOD 5 — Ben's sheath and balance calculation  (SF approach D)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def method5_ben(run, sf, gamma_e=None, gamma_i=None, ben_strict=False):
+    """
+    ``sf.compute_balance`` at the last time step t1, on the same dataset as
+    methods 1-4 (x guards kept, no y guards).  gamma_e / gamma_i default to
+    [sheath_boundary_simple] in BOUT.settings, as in method 2.
+
+    Returns the compute_balance dict plus ``t`` (the time index used), or
+    None if the dump lacks a field it needs.
+    """
+    ds = run["ds"]
+    ion = run["ions"][0] if run["ions"] else "d+"
+    try:
+        bal = sf.compute_balance(ds.isel(t=run["t1"]),
+                                 run["meta"].get("bout_ydim", "theta"),
+                                 run["meta"], ds.attrs.get("options"), ion,
+                                 _opt(ds, ion, "AA", 2.0),
+                                 _opt(ds, ion, "charge", 1.0),
+                                 gamma_e=gamma_e, gamma_i=gamma_i,
+                                 ben_strict=ben_strict)
+    except KeyError as exc:
+        print(f"[{BANNER}] Method 5 skipped: {exc} not in the dump.")
+        return None
+    bal["t"] = run["t1"]
+    bal["ion"] = ion
+    return bal
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Effective sheath transmission coefficient
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -787,7 +847,7 @@ def _rule(char="─", n=86):
     print(char * n)
 
 
-def print_report(run, m1, m2, m34, gam, chan=None, phi_chk=None):
+def print_report(run, m1, m2, m34, gam, chan=None, phi_chk=None, m5=None):
     """The whole terminal report: four methods, then the balance and gamma."""
     ds = run["ds"]
     print()
@@ -914,6 +974,42 @@ def print_report(run, m1, m2, m34, gam, chan=None, phi_chk=None):
         print(f"  {'TOTAL':<11}{'':>7}{'':>15}{'':>15}"
               f"{_w(m2['total']):>15}{ratio:>15}")
 
+    # ── METHOD 5 ──────────────────────────────────────────────────────────────
+    if m5 is not None:
+        print()
+        _rule("═")
+        print(f"  METHOD 5 — Ben's sheath calculation"
+              f"{' (ben_strict)' if m5['strict'] else ''} "
+              f"(gamma_e = {m5['gamma_e']:g}, gamma_i = {m5['gamma_i']:g}) [MW]")
+        _rule("═")
+        print(f"  ion = {m5['ion']}.  LAST STEP ONLY (t index {m5['t']}); "
+              f"methods 1-4 average steps {run['t0']}..{run['t1']}.")
+        print("  Electron flux = Z * ion flux (zero sheath current). In a drift "
+              "run that is only")
+        print("  right if phi is ambipolar: see the v_e/Cs check at the end.")
+        print(f"  {'target':<11}{'theta':>7}{'electrons':>15}{'ions':>15}"
+              f"{'total':>15}{'vs method 1':>15}")
+        _rule("-")
+        slots = [0, 3] if len(m5["targets"]) == 2 else [0, 1, 2, 3]
+        rows = {s: k for k, s in enumerate(slots)}
+        total5 = sum(m5["P_sheath_e"]) + sum(m5["P_sheath_i"])
+        for slot in range(4):
+            k = rows.get(slot)
+            if k is None:
+                print(f"  {TARGET_SHORT[slot]:<11}{'—':>7}{'—':>15}{'—':>15}"
+                      f"{'—':>15}{'—':>15}")
+                continue
+            pe, pi = m5["P_sheath_e"][k], m5["P_sheath_i"][k]
+            m1t = m1["per_target"][slot]
+            ratio = ("—" if not m1t or m1t["power"] == 0
+                     else f"{(pe + pi) / m1t['power']:.3f} x")
+            print(f"  {TARGET_SHORT[slot]:<11}{m5['targets'][k][0]:>7}"
+                  f"{_w(pe):>15}{_w(pi):>15}{_w(pe + pi):>15}{ratio:>15}")
+        _rule("-")
+        ratio = ("—" if not m1["total"] else f"{total5 / m1['total']:.3f} x")
+        print(f"  {'TOTAL':<11}{'':>7}{'':>15}{'':>15}"
+              f"{_w(total5):>15}{ratio:>15}")
+
     # ── METHOD 3 ──────────────────────────────────────────────────────────────
     print()
     _rule("═")
@@ -973,6 +1069,10 @@ def print_report(run, m1, m2, m34, gam, chan=None, phi_chk=None):
     print(f"    injected           (method 4) : {_w(P_in)} MW")
     print(f"    target load        (method 1) : {_w(P_out)} MW")
     print(f"    target load        (method 2) : {_w(m2.get('total'))} MW")
+    if m5 is not None:
+        print(f"    target load        (method 5) : "
+              f"{_w(sum(m5['P_sheath_e']) + sum(m5['P_sheath_i']))} MW"
+              f"    (last step)")
     print(f"    net volumetric     (method 3) : {_w(m34['total'])} MW")
     print(f"    dE/dt of stored P             : {_w(ddt)} MW"
           f"    (0 = steady state)")
@@ -1275,8 +1375,8 @@ def _clim(data, clip=99.5):
             min(m, hi_raw) if hi_raw > 0 else hi_raw)
 
 
-def make_plot(run, pp, args):
-    """Static or animated polygon plot of a raw or derived field."""
+def make_plot(run, pp, args, out_dir):
+    """Static or animated polygon plot of a raw or derived field, saved in out_dir."""
     grid = xr.open_dataset(run["grid_file"], engine="netcdf4")
     if "rm" not in grid or "zm" not in grid:
         print(f"[{BANNER}] Grid has no rm/zm corner mesh; cannot draw the "
@@ -1321,13 +1421,15 @@ def make_plot(run, pp, args):
         pp.plot_separatrices(ax, rm, zm, grid, ny_inner)
     plt.tight_layout()
 
-    if args.save:
-        if anim is not None:
-            print(f"[{BANNER}] Saving animation to {args.save} ...")
-            anim.save(args.save)
-        else:
-            plt.savefig(args.save, dpi=150, bbox_inches="tight")
-        print(f"[{BANNER}] Saved {args.save}")
+    name = re.sub(r"[^\w+.-]+", "_", args.var).strip("_")
+    if anim is not None:
+        path = os.path.join(out_dir, f"{name}_anim.{args.anim_fmt}")
+        print(f"[{BANNER}] Saving animation to {path} ...")
+        anim.save(path)
+    else:
+        path = os.path.join(out_dir, f"{name}_t{args.time}.{args.fmt}")
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"[{BANNER}] Saved {path}")
     return anim
 
 
@@ -1350,19 +1452,29 @@ def main():
     parser = argparse.ArgumentParser(
         description="Hermes-3 power audit: target load from the energy-flow "
                     "diagnostics (1) and the analytic sheath (2), the "
-                    "volumetric SP integral (3), and the actual injected "
-                    "power from P_src (4).",
+                    "volumetric SP integral (3), the actual injected "
+                    "power from P_src (4), and Ben's sheath and balance "
+                    "calculation (5).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("grid_file", help="BOUT++ grid file (.nc)")
-    parser.add_argument("sim_results", help="Directory of BOUT.dmp.*.nc files")
+    parser.add_argument("sims_dir",
+                        help="Folder containing the SF<angle>/SN simulation folders")
+    parser.add_argument("grid_dir",
+                        help="Folder containing the grid files (*sf<angle>*.nc, *lsn*.nc)")
+    parser.add_argument("--only", nargs="+", default=None, metavar="CASE",
+                        help="Only load these sim folders, e.g. --only SF45 SF165")
+    parser.add_argument("--sf_path", default=None,
+                        help="Explicit path to SF_heat_transport_pp_xhermes_withfluxes.py")
 
     parser.add_argument("--twindow", type=int, default=20,
                         help="Number of final timesteps to average over")
     parser.add_argument("--gamma_e", type=float, default=None,
                         help="Electron sheath transmission coefficient for "
-                             "method 2 (default: from BOUT.settings, else 3.5)")
+                             "methods 2 and 5 (default: from BOUT.settings, else 3.5)")
     parser.add_argument("--gamma_i", type=float, default=None,
-                        help="Ion sheath transmission coefficient for method 2")
+                        help="Ion sheath transmission coefficient for methods 2 and 5")
+    parser.add_argument("--ben_strict", action="store_true",
+                        help="Method 5 with Ben's formulas exactly instead of the "
+                             "Hermes-source ones (CLAUDE_BEN_FLUXES.md §3)")
 
     parser.add_argument("--plot", type=_str2bool, default=True,
                         metavar="True/False", help="Draw the polygon map")
@@ -1385,9 +1497,15 @@ def main():
                         help="Animate over all common timesteps")
     parser.add_argument("--interval", type=int, default=200,
                         help="Animation frame delay [ms]")
-    parser.add_argument("--save", default=None,
-                        help="Save the figure/animation here instead of only "
-                             "showing it")
+    parser.add_argument("--outdir",
+                        default="/Users/sruiz/Dev/PhD/SF_Sims/Modified_SF_Runs/"
+                                  "Post_Processing/Heat_Flux_comparisson/Drifts",
+                          help="Figures go to <outdir>/<case>/, e.g. Drifts/SF45")
+    parser.add_argument("--fmt", default="png", help="Static figure format")
+    parser.add_argument("--anim_fmt", default="mp4",
+                        help="Animation format (mp4 needs ffmpeg, gif uses pillow)")
+    parser.add_argument("--show", action="store_true",
+                        help="Also show the figures on screen")
     parser.add_argument("--branch_cuts", action="store_true",
                         help="Overlay the topological branch cuts")
     parser.add_argument("--seps", action="store_true",
@@ -1397,33 +1515,48 @@ def main():
 
     args = parser.parse_args()
 
-    if not os.path.isfile(args.grid_file):
-        sys.exit(f"Grid file not found: {args.grid_file}")
-    if not os.path.isdir(args.sim_results):
-        sys.exit(f"Not a directory: {args.sim_results}")
+    for d in (args.sims_dir, args.grid_dir):
+        if not os.path.isdir(d):
+            sys.exit(f"Not a directory: {d}")
 
-    run = load_run(args.sim_results, args.grid_file, twindow=args.twindow)
+    sf = _load_sf(args.sf_path)
+    cases = sf.discover_cases(args.sims_dir, args.grid_dir, only=args.only)
+    if not cases:
+        sys.exit("No simulations found.")
 
-    m1 = method1_energy_flow(run)
-    m2 = method2_analytic_sheath(run, gamma_e=args.gamma_e,
-                                 gamma_i=args.gamma_i)
-    m34 = methods34_volumetric(run)
-    gam = effective_gamma(run, m1, m2)
-    chan = volumetric_channels(run)
-    phi_chk = sheath_potential_check(run, m2)
+    pp = _load_pp(args.pp_path) if args.plot else None
+    anims = []
+    for c in cases:
+        run = load_run(c["path"], c["grid"], twindow=args.twindow)
 
-    print_report(run, m1, m2, m34, gam, chan, phi_chk)
+        m1 = method1_energy_flow(run)
+        m2 = method2_analytic_sheath(run, gamma_e=args.gamma_e,
+                                     gamma_i=args.gamma_i)
+        m34 = methods34_volumetric(run)
+        gam = effective_gamma(run, m1, m2)
+        chan = volumetric_channels(run)
+        phi_chk = sheath_potential_check(run, m2)
+        m5 = method5_ben(run, sf, gamma_e=args.gamma_e, gamma_i=args.gamma_i,
+                         ben_strict=args.ben_strict)
 
-    if args.plot:
-        pp = _load_pp(args.pp_path)
+        print_report(run, m1, m2, m34, gam, chan, phi_chk, m5)
+        if m5 is not None:
+            sf.print_balance_table(
+                [{"balance": m5,
+                  "approach": "D (Ben_example_fluxes, ben_strict)" if m5["strict"]
+                              else "D (Ben_example_fluxes)"}],
+                [c["label"]])
+
         if pp is not None:
+            out_dir = os.path.join(args.outdir, c["label"])
+            os.makedirs(out_dir, exist_ok=True)
             try:
-                anim = make_plot(run, pp, args)          # noqa: F841 (keep alive)
+                anims.append(make_plot(run, pp, args, out_dir))
             except KeyError as exc:
                 print(f"[{BANNER}] {exc}")
-            else:
-                if not args.save:
-                    plt.show()
+
+    if pp is not None and args.show:
+        plt.show()
 
 
 if __name__ == "__main__":
